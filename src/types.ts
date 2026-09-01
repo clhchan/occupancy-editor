@@ -11,9 +11,11 @@ export interface GridMetadata {
         y: number;
         theta: number;
     };
-    // Optional Start/Goal for the editor
-    start?: { x: number, y: number };
-    goal?: { x: number, y: number };
+    image?: string;
+    negate?: number;
+    occupied_thresh?: number;
+    free_thresh?: number;
+    mode?: string;
 }
 
 export type GridData = Int8Array; // Flattened 1D array
@@ -23,10 +25,4 @@ export interface GridState {
     height: number;
     data: GridData;
     metadata: GridMetadata;
-}
-
-export interface GridHistoryEntry {
-    data: GridData; // Snapshot of the grid data
-    width: number;
-    height: number;
 }
