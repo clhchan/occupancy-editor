@@ -1,5 +1,11 @@
 import React, { useRef, useEffect, useState, useCallback } from 'react';
-import { CELL_OCCUPIED, CELL_FREE, CELL_UNKNOWN } from '../types';
+import { CELL_OCCUPIED, CELL_FREE, CELL_UNKNOWN, type GridData } from '../types';
+import {
+    evaluatePlacement,
+    MIN_YAW_DRAG_PX,
+    yawFromDrag,
+    type PlacementStatus,
+} from '../utils/waypoints';
 
 interface GridCanvasProps {
     width: number;
@@ -9,6 +15,15 @@ interface GridCanvasProps {
     tool: string;
     brushSize: number;
     onUpdate: (data: Int8Array, commit?: boolean) => void;
+    // --- 地点标记 ---
+    // markingSlot 非空时画布进入标记模式：按下确定位置，拖动确定朝向。
+    markingSlot?: { id: string; color: string } | null;
+    placedWaypoints?: Array<{ id: string; name: string; color: string; col: number; row: number; yawRad: number | null }>;
+    baseMapData?: GridData | null;
+    onPlaceWaypoint?: (payload: { col: number; row: number; yawRad: number; status: PlacementStatus; reason: string }) => void;
+    onCancelMarking?: () => void;
+    // 标记箭头长度（栅格数），按地图真实尺寸绘制。
+    markerArrowCells?: number;
 }
 // Define handle for imperative methods
 export interface GridCanvasHandle {
@@ -39,7 +54,11 @@ function bresenham(x0: number, y0: number, x1: number, y1: number): { x: number;
     return points;
 }
 
-export const GridCanvas = React.forwardRef<GridCanvasHandle, GridCanvasProps>(({ width, height, data, backgroundData, tool, brushSize, onUpdate }, ref) => {
+export const GridCanvas = React.forwardRef<GridCanvasHandle, GridCanvasProps>(({
+    width, height, data, backgroundData, tool, brushSize, onUpdate,
+    markingSlot = null, placedWaypoints = [], baseMapData = null,
+    onPlaceWaypoint, onCancelMarking, markerArrowCells = 15,
+}, ref) => {
     const canvasRef = useRef<HTMLCanvasElement>(null);
     const containerRef = useRef<HTMLDivElement>(null);
 
@@ -67,6 +86,12 @@ export const GridCanvas = React.forwardRef<GridCanvasHandle, GridCanvasProps>(({
     const gestureChangedRef = useRef(false);
     const pendingPreviewRef = useRef<Int8Array | null>(null);
     const previewFrameRef = useRef<number | null>(null);
+
+    // --- 地点标记状态 ---
+    // 标记手势：按下记录起点栅格，拖动更新当前栅格，松开回调提交。
+    const [isMarking, setIsMarking] = useState(false);
+    const [markPreview, setMarkPreview] = useState<{ col: number; row: number; yawRad: number | null; status: PlacementStatus; reason: string } | null>(null);
+    const markStartRef = useRef<{ x: number; y: number } | null>(null);
 
     updateRef.current = onUpdate;
 
@@ -313,6 +338,79 @@ export const GridCanvas = React.forwardRef<GridCanvasHandle, GridCanvasProps>(({
                 }
             }
 
+            // 5.5 已放置地点常驻显示 + 标记手势预览。
+            // 绘制在内部栅格坐标系里，与底图对齐；线宽和字号除以缩放
+            // 比例，保证屏幕上观感恒定。箭头带白色衬底，任何底色上都醒目。
+            const statusColor = (status: PlacementStatus, fallback: string) => (
+                status === 'blocked' ? '#dc2626' : fallback
+            );
+            const drawWaypointMarker = (col: number, row: number, color: string, yawRad: number | null, label: string | null, preview = false) => {
+                ctx.save();
+                ctx.globalAlpha = preview ? 0.42 : 1;
+                const centerXPos = col + 0.5;
+                const centerYPos = row + 0.5;
+                // 中心点：实心彩点加白色描边
+                ctx.fillStyle = color;
+                ctx.strokeStyle = '#ffffff';
+                ctx.lineWidth = 1.5 / transform.k;
+                ctx.beginPath();
+                ctx.arc(centerXPos, centerYPos, Math.max(1, 4 / transform.k), 0, Math.PI * 2);
+                ctx.fill();
+                ctx.stroke();
+                // 朝向箭头：按地图真实尺寸绘制（约 0.76 m），白色衬底 + 彩色主体
+                if (yawRad !== null) {
+                    const arrowLength = Math.max(markerArrowCells, 3);
+                    const endX = centerXPos + Math.cos(yawRad) * arrowLength;
+                    const endY = centerYPos - Math.sin(yawRad) * arrowLength;
+                    const headSize = Math.max(2, 13 / transform.k);
+                    const headAngle = Math.PI / 7;
+                    const strokeArrow = (lineWidthScreen: number, style: string) => {
+                        ctx.lineWidth = lineWidthScreen / transform.k;
+                        ctx.strokeStyle = style;
+                        ctx.beginPath();
+                        ctx.moveTo(centerXPos, centerYPos);
+                        ctx.lineTo(endX, endY);
+                        ctx.stroke();
+                        ctx.fillStyle = style;
+                        ctx.beginPath();
+                        ctx.moveTo(endX, endY);
+                        ctx.lineTo(endX - Math.cos(yawRad - headAngle) * headSize, endY + Math.sin(yawRad - headAngle) * headSize);
+                        ctx.lineTo(endX - Math.cos(yawRad + headAngle) * headSize, endY + Math.sin(yawRad + headAngle) * headSize);
+                        ctx.closePath();
+                        ctx.fill();
+                    };
+                    strokeArrow(7, '#ffffff');
+                    strokeArrow(3.5, color);
+                }
+                // 名称标签
+                if (label) {
+                    const fontSize = 15 / transform.k;
+                    ctx.font = `bold ${fontSize}px sans-serif`;
+                    ctx.textAlign = 'center';
+                    ctx.textBaseline = 'top';
+                    const labelY = centerYPos + 6 / transform.k;
+                    const textWidth = ctx.measureText(label).width;
+                    ctx.fillStyle = preview ? `${color}E6` : color;
+                    ctx.fillRect(centerXPos - textWidth / 2 - 4 / transform.k, labelY, textWidth + 8 / transform.k, fontSize + 4 / transform.k);
+                    ctx.fillStyle = '#ffffff';
+                    ctx.fillText(label, centerXPos, labelY + 2 / transform.k);
+                }
+                ctx.restore();
+            };
+            for (const waypoint of placedWaypoints) {
+                drawWaypointMarker(waypoint.col, waypoint.row, waypoint.color, waypoint.yawRad, waypoint.name);
+            }
+            if (markPreview && markingSlot) {
+                drawWaypointMarker(
+                    markPreview.col,
+                    markPreview.row,
+                    statusColor(markPreview.status, markingSlot.color),
+                    markPreview.yawRad,
+                    markPreview.status === 'blocked' ? markPreview.reason : null,
+                    markPreview.status !== 'blocked',
+                );
+            }
+
             ctx.restore();
 
             // 6. Axis Rulers (center-based coordinates)
@@ -376,7 +474,7 @@ export const GridCanvas = React.forwardRef<GridCanvasHandle, GridCanvasProps>(({
 
         const id = requestAnimationFrame(render);
         return () => cancelAnimationFrame(id);
-    }, [width, height, data, backgroundData, transform, previewRect, previewLine, previewTool, tool, brushSize, hoverCoord, isDrawing, internalToDisplay]);
+    }, [width, height, data, backgroundData, transform, previewRect, previewLine, previewTool, tool, brushSize, hoverCoord, isDrawing, internalToDisplay, markingSlot, placedWaypoints, markPreview, markerArrowCells]);
 
 
     const flushPreview = useCallback(() => {
@@ -449,6 +547,22 @@ export const GridCanvas = React.forwardRef<GridCanvasHandle, GridCanvasProps>(({
         setTransform({ k: newK, x: newTx, y: newTy });
     };
 
+    // --- 地点标记 ---
+    // Esc 取消标记手势。
+    useEffect(() => {
+        if (!markingSlot) return;
+        const handleKeyDown = (event: KeyboardEvent) => {
+            if (event.key === 'Escape' && !isMarking) onCancelMarking?.();
+        };
+        window.addEventListener('keydown', handleKeyDown);
+        return () => window.removeEventListener('keydown', handleKeyDown);
+    }, [markingSlot, isMarking, onCancelMarking]);
+
+    const evaluateMarkPlacement = useCallback((col: number, row: number) => {
+        const mapData = baseMapData || data;
+        return evaluatePlacement({ col, row, width, height, mapData });
+    }, [baseMapData, data, height, width]);
+
     const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
         if (e.button === 2 || e.button === 1 || (e.button === 0 && e.altKey)) {
             // Prevent Edge mouse gestures/autoscroll while preserving right/middle-button panning.
@@ -470,6 +584,17 @@ export const GridCanvas = React.forwardRef<GridCanvasHandle, GridCanvasProps>(({
 
             // Bounds check (internal coordinates)
             if (internal.x < 0 || internal.x >= width || internal.y < 0 || internal.y >= height) return;
+
+            // 地点标记手势：按下确定位置，拖动确定朝向，松开提交。
+            if (markingSlot) {
+                pointerIdRef.current = e.pointerId;
+                markStartRef.current = internal;
+                setIsMarking(true);
+                e.currentTarget.setPointerCapture?.(e.pointerId);
+                const report = evaluateMarkPlacement(internal.x, internal.y);
+                setMarkPreview({ col: internal.x, row: internal.y, yawRad: null, status: report.status, reason: report.reason });
+                return;
+            }
 
             pointerIdRef.current = e.pointerId;
             gestureToolRef.current = tool;
@@ -530,6 +655,22 @@ export const GridCanvas = React.forwardRef<GridCanvasHandle, GridCanvasProps>(({
             return;
         }
 
+        // 地点标记拖动：位置固定在按下点，拖动只决定朝向。
+        if (isMarking && markStartRef.current) {
+            const start = markStartRef.current;
+            const cellDistance = Math.hypot(internal.x - start.x, internal.y - start.y);
+            const yawRad = cellDistance * transform.k >= MIN_YAW_DRAG_PX
+                ? yawFromDrag(start.x, start.y, internal.x, internal.y)
+                : null;
+            const report = evaluateMarkPlacement(start.x, start.y);
+            setMarkPreview((current) => (
+                current && current.yawRad === yawRad && current.status === report.status && current.reason === report.reason
+                    ? current
+                    : { col: start.x, row: start.y, yawRad, status: report.status, reason: report.reason }
+            ));
+            return;
+        }
+
         // Draw
         if (isDrawing) {
             const display = screenToDisplay(mouseX, mouseY);
@@ -565,6 +706,13 @@ export const GridCanvas = React.forwardRef<GridCanvasHandle, GridCanvasProps>(({
         const activeTool = gestureToolRef.current || tool;
         setIsPanning(false);
         setIsDrawing(false);
+
+        // 结束地点标记手势；提交在 handlePointerUp 中先行处理，这里只复位。
+        if (isMarking) {
+            setIsMarking(false);
+            markStartRef.current = null;
+            setMarkPreview(null);
+        }
 
         if (activeTool === 'rect' && previewRect) {
             const points = [];
@@ -603,6 +751,16 @@ export const GridCanvas = React.forwardRef<GridCanvasHandle, GridCanvasProps>(({
         if (isPanning || e.button === 2 || e.button === 1) {
             e.preventDefault();
             e.stopPropagation();
+        }
+        // 只有形成有效朝向拖拽才提交；单击只结束本次预览。
+        if (isMarking && markPreview && markPreview.yawRad !== null && markStartRef.current) {
+            onPlaceWaypoint?.({
+                col: markPreview.col,
+                row: markPreview.row,
+                yawRad: markPreview.yawRad,
+                status: markPreview.status,
+                reason: markPreview.reason,
+            });
         }
         finishGesture();
     };

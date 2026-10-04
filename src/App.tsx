@@ -4,8 +4,12 @@ import {
     CircleHelp,
     Download,
     Eraser,
+    Eye,
+    EyeOff,
     File,
     Folder,
+    Github,
+    MapPin,
     Minus,
     Pencil,
     Redo,
@@ -25,11 +29,34 @@ import { GridCanvas, type GridCanvasHandle } from './components/GridCanvas';
 import { useGrid } from './hooks/useGrid';
 import { CELL_FREE, CELL_OCCUPIED, type GridData, type GridMetadata } from './types';
 import { gridToPgm, gridToYaml, parseMapYaml, parsePgm, pgmToGrid } from './utils/rosMap';
+import {
+    EXAMPLE_SLOT_COUNT,
+    PRESET_SLOTS,
+    WAYPOINTS_DEFAULT_FILENAME,
+    WAYPOINTS_DEFAULT_FRAME,
+    WAYPOINTS_FILE_VERSION,
+    createWaypoint,
+    defaultSlotName,
+    describeBindingMismatch,
+    mapBindingFromMetadata,
+    markerArrowCells,
+    normalizeDegrees,
+    parseWaypointsYaml,
+    quaternionToYaw,
+    serializeWaypointsYaml,
+    worldToPixel,
+    yawToQuaternion,
+    type Waypoint,
+    type WaypointFile,
+} from './utils/waypoints';
 
 type Tool = 'pencil' | 'rect' | 'line' | 'eraser' | 'unknown';
-type EditMode = 'map' | 'mask';
+type EditMode = 'map' | 'mask' | 'waypoints';
 type BrowserMode = 'open' | 'save';
-type BrowserPathKind = 'open-map' | 'open-mask' | 'save-map' | 'save-mask';
+type BrowserPathKind = 'open-map' | 'open-mask' | 'open-waypoints' | 'save-map' | 'save-mask' | 'save-waypoints';
+
+const EXAMPLE_SLOT_IDS = PRESET_SLOTS.slice(0, EXAMPLE_SLOT_COUNT).map((slot) => slot.id);
+const EXAMPLE_SLOT_NAMES = Object.fromEntries(EXAMPLE_SLOT_IDS.map((id) => [id, defaultSlotName(id)]));
 
 interface BoardEntry {
     name: string;
@@ -79,8 +106,10 @@ const defaultMetadata: GridMetadata = {
 const BROWSER_PATH_KEYS: Record<BrowserPathKind, string> = {
     'open-map': 'occupancy-editor:last-open-path',
     'open-mask': 'occupancy-editor:last-open-path',
+    'open-waypoints': 'occupancy-editor:last-open-path',
     'save-map': 'occupancy-editor:last-save-path',
     'save-mask': 'occupancy-editor:last-save-path',
+    'save-waypoints': 'occupancy-editor:last-save-path',
 };
 const LEGACY_OPEN_PATH_KEYS = [
     'occupancy-editor:last-open-map-path',
@@ -153,6 +182,12 @@ async function fetchFile(entry: BoardEntry, errorMessage: string): Promise<Respo
     return response;
 }
 
+async function fetchFileByPath(path: string): Promise<Response | null> {
+    const response = await fetch(`/api/file?path=${encodeURIComponent(path)}`, { cache: 'no-store' });
+    if (!response.ok) return null;
+    return response;
+}
+
 async function deleteFile(entry: BoardEntry): Promise<void> {
     const response = await fetch('/api/delete', {
         method: 'POST',
@@ -206,18 +241,56 @@ function formatSize(size?: number): string {
     return `${(size! / 1024 / 1024).toFixed(1)} MB`;
 }
 
-function NoticeBanner({ notice, embedded = false }: { notice: { text: string; error?: boolean }; embedded?: boolean }) {
-    const Icon = notice.error ? XCircle : CheckCircle2;
+function NoticeBanner({ notice, embedded = false, topClass = 'top-20' }: { notice: { text: string; error?: boolean }; embedded?: boolean; topClass?: string }) {    const Icon = notice.error ? XCircle : CheckCircle2;
     return (
         <div role={notice.error ? 'alert' : 'status'} className={clsx(
             'flex items-start gap-2 text-sm',
             embedded
                 ? 'border-b border-gray-200 bg-white px-5 py-3 text-gray-700'
-                : 'fixed left-1/2 top-20 z-[70] max-w-[calc(100vw-2rem)] -translate-x-1/2 rounded-md border border-gray-200 bg-white px-4 py-3 text-gray-700 shadow-2xl',
+                : clsx('fixed left-1/2 z-[70] max-w-[calc(100vw-2rem)] -translate-x-1/2 rounded-md border border-gray-200 bg-white px-4 py-3 text-gray-700 shadow-2xl', topClass),
         )}>
             <Icon size={18} className={clsx('mt-0.5 shrink-0', notice.error ? 'text-red-500' : 'text-emerald-500')} />
             <span>{notice.text}</span>
         </div>
+    );
+}
+
+// 数值手输框：本地草稿 + 失焦/回车提交，避免输入中间态被拒绝。
+// digits 指定显示的小数位数；输入完整精度保留，仅展示时截断。
+// onEnterDone 在回车提交后触发，用于退出标记（编辑完成）。
+function NumberField({ value, onCommit, placeholder, digits, onEnterDone }: { value: number; onCommit: (value: number) => void; placeholder?: string; digits?: number; onEnterDone?: () => void }) {
+    const format = (input: number) => (digits !== undefined ? input.toFixed(digits) : String(input));
+    const [draft, setDraft] = useState(format(value));
+    const [focused, setFocused] = useState(false);
+    const enterRef = useRef(false);
+    useEffect(() => {
+        if (!focused) setDraft(format(value));
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [focused, value]);
+    const commit = () => {
+        const parsed = Number(draft.trim());
+        if (Number.isFinite(parsed)) onCommit(parsed);
+        else setDraft(format(value));
+    };
+    return (
+        <input
+            type="text"
+            inputMode="decimal"
+            value={draft}
+            placeholder={placeholder}
+            onFocus={() => setFocused(true)}
+            onChange={(event) => setDraft(event.target.value)}
+            onBlur={() => {
+                setFocused(false);
+                commit();
+                if (enterRef.current) {
+                    enterRef.current = false;
+                    onEnterDone?.();
+                }
+            }}
+            onKeyDown={(event) => { if (event.key === 'Enter') { enterRef.current = true; event.currentTarget.blur(); } }}
+            className="min-w-0 flex-1 rounded border border-gray-300 px-1.5 py-1 text-left font-mono text-xs text-gray-700 outline-none focus:border-black"
+        />
     );
 }
 
@@ -247,6 +320,20 @@ function App() {
     const [maskHistoryTruncated, setMaskHistoryTruncated] = useState(false);
     const [maskOccupiedCount, setMaskOccupiedCount] = useState(0);
     const maskEditStartRef = useRef<GridData | null>(null);
+    // --- 地点层状态 ---
+    const [waypointEntries, setWaypointEntries] = useState<Waypoint[]>([]);
+    const [draftSlotNames, setDraftSlotNames] = useState<Record<string, string>>(() => ({ ...EXAMPLE_SLOT_NAMES }));
+    const [waypointHistory, setWaypointHistory] = useState<Waypoint[][]>([]);
+    const [waypointFuture, setWaypointFuture] = useState<Waypoint[][]>([]);
+    const [waypointsDirty, setWaypointsDirty] = useState(false);
+    const [waypointsPath, setWaypointsPath] = useState('');
+    const [markingSlotId, setMarkingSlotId] = useState<string | null>(null);
+    // 地点标记在地图上的显示开关，默认显示。
+    const [waypointsVisible, setWaypointsVisible] = useState(true);
+    // 双击展开的槽位：显示名称和 x/y/朝向 编辑框。
+    const [expandedSlotId, setExpandedSlotId] = useState<string | null>(null);
+    const openedWaypointsRef = useRef<Waypoint[]>([]);
+    const openedSlotNamesRef = useRef<Record<string, string>>({ ...EXAMPLE_SLOT_NAMES });
     const [sourcePath, setSourcePath] = useState('');
     const [loaded, setLoaded] = useState(false);
     const [mapDirty, setMapDirty] = useState(false);
@@ -262,10 +349,27 @@ function App() {
         if (mode === 'map') return gridData;
         return maskData || new Int8Array(width * height).fill(CELL_FREE);
     }, [gridData, height, maskData, mode, width]);
-    const activeCanUndo = mode === 'map' ? canUndo : maskHistory.length > 0;
-    const activeCanRedo = mode === 'map' ? canRedo : maskFuture.length > 0;
-    const activeDirty = mode === 'map' ? mapDirty : maskDirty;
-    const hasChanges = mapDirty || maskDirty;
+    const activeCanUndo = mode === 'map' ? canUndo : mode === 'mask' ? maskHistory.length > 0 : waypointHistory.length > 0;
+    const activeCanRedo = mode === 'map' ? canRedo : mode === 'mask' ? maskFuture.length > 0 : waypointFuture.length > 0;
+    const activeDirty = mode === 'map' ? mapDirty : mode === 'mask' ? maskDirty : waypointsDirty;
+    const hasChanges = mapDirty || maskDirty || waypointsDirty;
+    const markingSlot = useMemo(() => {
+        if (mode !== 'waypoints' || !markingSlotId) return null;
+        const slot = PRESET_SLOTS.find((candidate) => candidate.id === markingSlotId);
+        return slot ? { id: slot.id, color: slot.color } : null;
+    }, [markingSlotId, mode]);
+    const placedWaypoints = useMemo(() => (waypointsVisible ? waypointEntries.map((waypoint) => {
+        const slot = PRESET_SLOTS.find((candidate) => candidate.id === waypoint.id);
+        return {
+            id: waypoint.id,
+            name: waypoint.name,
+            color: slot?.color || '#334155',
+            col: waypoint.pixel.col,
+            row: waypoint.pixel.row,
+            yawRad: quaternionToYaw(waypoint.orientation),
+        };
+    }) : []), [waypointEntries, waypointsVisible]);
+    const markerArrowCellsValue = useMemo(() => markerArrowCells(metadata.resolution), [metadata.resolution]);
     const handleBrushToolWheel = useCallback((event: WheelEvent<HTMLButtonElement>) => {
         if (!loaded || !['pencil', 'eraser'].includes(tool) || event.deltaY === 0) return;
         event.preventDefault();
@@ -275,9 +379,10 @@ function App() {
     const saveConflict = useMemo(() => {
         if (!browser.open || browser.mode !== 'save' || !browser.filename.trim()) return false;
         const base = safeBaseName(browser.filename);
-        const targets = new Set([`${base}.pgm`, `${base}.yaml`].map((name) => name.toLowerCase()));
+        const names = browser.saveKind === 'waypoints' ? [`${base}.yaml`] : [`${base}.pgm`, `${base}.yaml`];
+        const targets = new Set(names.map((name) => name.toLowerCase()));
         return browser.entries.some((entry) => entry.type === 'file' && targets.has(entry.name.toLowerCase()));
-    }, [browser.entries, browser.filename, browser.mode, browser.open]);
+    }, [browser.entries, browser.filename, browser.mode, browser.open, browser.saveKind]);
 
     useEffect(() => {
         if (mode === 'map' && isMapAtInitial && mapDirty) setMapDirty(false);
@@ -329,7 +434,15 @@ function App() {
     const handleUndo = useCallback(() => {
         const maskUndoToInitial = mode === 'mask' && maskHistory.length === 1 && !maskHistoryTruncated;
         if (mode === 'map') undo();
-        else if (maskData && maskHistory.length) {
+        else if (mode === 'waypoints') {
+            if (!waypointHistory.length) return;
+            const previous = waypointHistory[waypointHistory.length - 1];
+            setWaypointFuture((future) => [...future, waypointEntries]);
+            setWaypointEntries(previous);
+            setWaypointHistory((history) => history.slice(0, -1));
+            setMarkingSlotId(null);
+            setExpandedSlotId(null);
+        } else if (maskData && maskHistory.length) {
             const previous = maskHistory[maskHistory.length - 1];
             setMaskFuture((future) => appendLayerSnapshot(future, new Int8Array(maskData)));
             setMaskData(new Int8Array(previous));
@@ -338,12 +451,21 @@ function App() {
             if (maskUndoToInitial) setMaskDirty(false);
         }
         if (mode === 'map') setMapDirty(true);
+        else if (mode === 'waypoints') setWaypointsDirty(true);
         else if (!maskUndoToInitial) setMaskDirty(true);
-    }, [maskData, maskHistory, maskHistoryTruncated, mode, undo]);
+    }, [maskData, maskHistory, maskHistoryTruncated, mode, undo, waypointEntries, waypointHistory]);
 
     const handleRedo = useCallback(() => {
         if (mode === 'map') redo();
-        else if (maskData && maskFuture.length) {
+        else if (mode === 'waypoints') {
+            if (!waypointFuture.length) return;
+            const next = waypointFuture[waypointFuture.length - 1];
+            setWaypointHistory((history) => [...history, waypointEntries]);
+            setWaypointEntries(next);
+            setWaypointFuture((future) => future.slice(0, -1));
+            setMarkingSlotId(null);
+            setExpandedSlotId(null);
+        } else if (maskData && maskFuture.length) {
             const next = maskFuture[maskFuture.length - 1];
             if (maskHistory.length >= MAX_LAYER_HISTORY) setMaskHistoryTruncated(true);
             setMaskHistory((history) => appendLayerSnapshot(history, new Int8Array(maskData)));
@@ -352,8 +474,173 @@ function App() {
             setMaskFuture((future) => future.slice(0, -1));
         }
         if (mode === 'map') setMapDirty(true);
+        else if (mode === 'waypoints') setWaypointsDirty(true);
         else setMaskDirty(true);
-    }, [maskData, maskFuture, maskHistory.length, mode, redo]);
+    }, [maskData, maskFuture, maskHistory.length, mode, redo, waypointEntries, waypointFuture]);
+
+    // --- 地点层操作 ---
+    // 空卡只是编辑器草稿；只有完成地图标记后才创建可导出的点位。
+    const handlePlaceWaypoint = useCallback((payload: { col: number; row: number; yawRad: number; status: 'ok' | 'blocked'; reason: string }) => {
+        const slotId = markingSlotId;
+        if (!slotId) return;
+        if (payload.status === 'blocked') {
+            showNotice(`无法标记：${payload.reason}`, true);
+            return;
+        }
+        const slot = PRESET_SLOTS.find((candidate) => candidate.id === slotId);
+        if (!slot) return;
+        const existing = waypointEntries.find((waypoint) => waypoint.id === slotId);
+        const name = (existing?.name ?? draftSlotNames[slotId] ?? `地点 ${slotId}`).trim();
+        if (!name) {
+            showNotice('请先填写地点名称', true);
+            return;
+        }
+        if (waypointEntries.some((waypoint) => waypoint.id !== slotId && waypoint.name.trim() === name)) {
+            showNotice('地点名称不能重复', true);
+            return;
+        }
+        const waypoint = createWaypoint({
+            id: slotId,
+            name,
+            aliases: existing?.aliases || [],
+            col: payload.col,
+            row: payload.row,
+            yawRad: payload.yawRad,
+            height,
+            metadata,
+        });
+        setWaypointHistory((history) => [...history, waypointEntries]);
+        setWaypointFuture([]);
+        setWaypointEntries((entries) => [...entries.filter((item) => item.id !== slotId), waypoint]);
+        setWaypointsDirty(true);
+        // 连续标记：地图上的标记本身就是成功反馈，不再弹顶部通知，
+        // 避免与画布内提示条在视觉上打架；只有失败才弹通知。
+    }, [draftSlotNames, height, markingSlotId, metadata, showNotice, waypointEntries]);
+
+    const updateWaypointField = useCallback((id: string, patch: Partial<Pick<Waypoint, 'name' | 'aliases'>>) => {
+        setWaypointEntries((entries) => entries.map((item) => (item.id === id ? { ...item, ...patch } : item)));
+        setWaypointsDirty(true);
+    }, []);
+
+    const updateSlotName = useCallback((id: string, name: string) => {
+        setDraftSlotNames((names) => ({ ...names, [id]: name }));
+        if (waypointEntries.some((waypoint) => waypoint.id === id)) updateWaypointField(id, { name });
+    }, [updateWaypointField, waypointEntries]);
+
+    // 手输世界坐标：x/y 提交后反算像素位置；输入朝向后该点转为固定朝向。
+    const updateWaypointPose = useCallback((id: string, patch: { x?: number; y?: number; yawDeg?: number }) => {
+        setWaypointEntries((entries) => entries.map((item) => {
+            if (item.id !== id) return item;
+            const next: Waypoint = { ...item };
+            if (patch.x !== undefined || patch.y !== undefined) {
+                const position = {
+                    x: patch.x !== undefined ? patch.x : item.position.x,
+                    y: patch.y !== undefined ? patch.y : item.position.y,
+                    z: 0,
+                };
+                next.position = position;
+                next.pixel = worldToPixel(position.x, position.y, height, metadata);
+            }
+            if (patch.yawDeg !== undefined) {
+                const yawRad = (patch.yawDeg * Math.PI) / 180;
+                next.orientation = yawToQuaternion(yawRad);
+                next.yawDeg = normalizeDegrees(patch.yawDeg);
+            }
+            return next;
+        }));
+        setWaypointsDirty(true);
+    }, [height, metadata]);
+
+    const clearWaypoint = useCallback((slotId: string) => {
+        setWaypointHistory((history) => [...history, waypointEntries]);
+        setWaypointFuture([]);
+        setWaypointEntries((entries) => entries.filter((item) => item.id !== slotId));
+        setWaypointsDirty(true);
+        if (markingSlotId === slotId) setMarkingSlotId(null);
+        if (expandedSlotId === slotId) setExpandedSlotId(null);
+    }, [expandedSlotId, markingSlotId, waypointEntries]);
+
+    const startMarking = useCallback((slotId: string) => {
+        if (!loaded) return;
+        clearNotice();
+        setMode('waypoints');
+        setMarkingSlotId(slotId);
+        setExpandedSlotId((current) => (current === slotId ? current : null));
+    }, [clearNotice, loaded]);
+
+    // 统一退出：结束标记模式、收起编辑框。切换到其他槽位时只换目标，
+    // 不重置编辑框，避免状态残留导致的“卡住”感。
+    const exitMarking = useCallback(() => {
+        setMarkingSlotId(null);
+        setExpandedSlotId(null);
+    }, []);
+
+    // 切换标记目标槽位：不收起编辑框，双击计数自然重置。
+    const switchMarking = useCallback((slotId: string) => {
+        setMarkingSlotId((current) => (current === slotId ? current : slotId));
+        setExpandedSlotId((current) => (current === slotId ? current : null));
+    }, []);
+
+    // 连续标记：放置后不退出标记模式。地图和地点卡片内保持标记态；
+    // 点击页面空白处退出，同时收起双击展开的编辑框。
+    // 监听放在捕获阶段，保证先于其他点击处理。
+    const canvasAreaRef = useRef<HTMLElement>(null);
+    const waypointsPanelRef = useRef<HTMLElement>(null);
+    useEffect(() => {
+        if (!markingSlotId) return;
+        const handlePointerDown = (event: globalThis.PointerEvent) => {
+            const target = event.target;
+            if (!(target instanceof Node)) return;
+            if (canvasAreaRef.current?.contains(target)) return;
+            if (waypointsPanelRef.current?.contains(target) && target instanceof Element && target.closest('[data-waypoint-card]')) return;
+            exitMarking();
+        };
+        window.addEventListener('pointerdown', handlePointerDown, true);
+        return () => window.removeEventListener('pointerdown', handlePointerDown, true);
+    }, [markingSlotId, exitMarking]);
+
+    // 切回原图层或禁行区层时，彻底结束标记态，避免残留的监听和编辑框。
+    useEffect(() => {
+        if (mode !== 'waypoints' && (markingSlotId || expandedSlotId)) {
+            setMarkingSlotId(null);
+            setExpandedSlotId(null);
+        }
+    }, [expandedSlotId, markingSlotId, mode]);
+
+    // 应用地点文件文本：绑定校验失败时拒绝加载，避免换图后点位漂移。
+    // 返回 null 表示成功，返回字符串表示失败原因。context 用于打开地图后
+    // 立即自动加载的场景，此时 state 中的地图尺寸还是旧值，必须显式传入；
+    // image 参与地图文件名匹配。
+    const applyWaypointsText = useCallback((text: string, path: string, context?: { width: number; height: number; metadata: GridMetadata; image?: string | null }): string | null => {
+        const contextWidth = context?.width ?? width;
+        const contextHeight = context?.height ?? height;
+        const contextMetadata = context?.metadata ?? metadata;
+        const expectedImage = context?.image ?? sourcePath.split('/').pop() ?? null;
+        try {
+            const parsed = parseWaypointsYaml(text, contextHeight, contextMetadata);
+            const mismatch = describeBindingMismatch(parsed.mapBinding, contextMetadata, contextWidth, contextHeight, expectedImage);
+            if (mismatch) throw new Error(mismatch);
+            // 未知 ID 必须显式报错，避免旧文件被静默过滤后保存为空。
+            const validSlotIds = new Set(PRESET_SLOTS.map((slot) => slot.id));
+            const unknown = parsed.waypoints.find((waypoint) => !validSlotIds.has(waypoint.id));
+            if (unknown) throw new Error(`点位 ID ${unknown.id} 不属于当前 A–J 槽位，请先转换地点文件`);
+            const entries = parsed.waypoints;
+            const slotNames = Object.fromEntries(entries.map((waypoint) => [waypoint.id, waypoint.name]));
+            openedWaypointsRef.current = entries.map((waypoint) => ({ ...waypoint }));
+            openedSlotNamesRef.current = slotNames;
+            setWaypointEntries(entries);
+            setDraftSlotNames(slotNames);
+            setMarkingSlotId(null);
+            setExpandedSlotId(null);
+            setWaypointHistory([]);
+            setWaypointFuture([]);
+            setWaypointsDirty(false);
+            setWaypointsPath(path);
+            return null;
+        } catch (error) {
+            return error instanceof Error ? error.message : '地点文件格式无效';
+        }
+    }, [height, metadata, sourcePath, width]);
 
     const loadDirectory = useCallback(async (path: string, pathKind: BrowserPathKind) => {
         setBrowser((current) => ({ ...current, loading: true, path }));
@@ -396,8 +683,8 @@ function App() {
 
     const openBrowser = useCallback((browserMode: BrowserMode, saveKind: EditMode | null = null) => {
         const pathKind: BrowserPathKind = browserMode === 'open'
-            ? saveKind === 'mask' ? 'open-mask' : 'open-map'
-            : saveKind === 'mask' ? 'save-mask' : 'save-map';
+            ? saveKind === 'mask' ? 'open-mask' : saveKind === 'waypoints' ? 'open-waypoints' : 'open-map'
+            : saveKind === 'mask' ? 'save-mask' : saveKind === 'waypoints' ? 'save-waypoints' : 'save-map';
         clearNotice();
         setBrowser({
             ...initialBrowser,
@@ -408,11 +695,13 @@ function App() {
             filename: browserMode === 'save'
                 ? (saveKind === 'mask'
                     ? (maskPath ? safeBaseName(maskPath.split('/').pop() || 'keepout_mask') : 'keepout_mask')
-                    : `${safeBaseName(sourcePath.split('/').pop() || 'map')}_edited`)
+                    : saveKind === 'waypoints'
+                        ? (waypointsPath ? safeBaseName(waypointsPath.split('/').pop() || WAYPOINTS_DEFAULT_FILENAME) : WAYPOINTS_DEFAULT_FILENAME)
+                        : `${safeBaseName(sourcePath.split('/').pop() || 'map')}_edited`)
                 : '',
         });
         void loadDirectory(readBrowserPath(pathKind), pathKind);
-    }, [clearNotice, loadDirectory, maskPath, sourcePath]);
+    }, [clearNotice, loadDirectory, maskPath, sourcePath, waypointsPath]);
 
     const closeBrowser = useCallback(() => setBrowser((current) => ({ ...current, open: false })), []);
 
@@ -465,13 +754,40 @@ function App() {
             setMaskHistoryTruncated(false);
             setSourcePath(selected.path);
             setMaskPath('');
-            setLoaded(true);
+            setWaypointEntries([]);
+            setDraftSlotNames({ ...EXAMPLE_SLOT_NAMES });
+            setWaypointHistory([]);
+            setWaypointFuture([]);
+            setWaypointsDirty(false);
+            setWaypointsPath('');
+            openedWaypointsRef.current = [];
+            openedSlotNamesRef.current = { ...EXAMPLE_SLOT_NAMES };
+            setMarkingSlotId(null);
+            setExpandedSlotId(null);
             setMapDirty(false);
             setMaskDirty(false);
             setMode('map');
+            let loadNotice = yamlEntry ? `已加载 ${selected.name}` : `已加载 ${selected.name}（使用默认 YAML 参数）`;
+            let waypointLoadError = '';
+            // 打开地图后自动尝试加载同目录的地点文件，失败或不存在时保持为空。
+            const separatorIndex = selected.path.lastIndexOf('/');
+            const mapDirectory = separatorIndex >= 0 ? selected.path.slice(0, separatorIndex) : '.';
+            const waypointsPathCandidate = joinBoardPath(mapDirectory, WAYPOINTS_DEFAULT_FILENAME);
+            try {
+                const waypointsResponse = await fetchFileByPath(waypointsPathCandidate);
+                if (waypointsResponse) {
+                    const waypointsText = await waypointsResponse.text();
+                    const loadError = applyWaypointsText(waypointsText, waypointsPathCandidate, { width: parsed.width, height: parsed.height, metadata: fileMetadata, image: selected.name });
+                    if (loadError) waypointLoadError = loadError;
+                    else loadNotice = `已加载地图和地点文件 ${WAYPOINTS_DEFAULT_FILENAME}`;
+                }
+            } catch {
+                // 自动加载失败不影响地图本身，保持地点为空即可。
+            }
+            setLoaded(true);
             closeBrowser();
             window.setTimeout(() => canvasRef.current?.resetView(), 0);
-            showNotice(yamlEntry ? `已加载 ${selected.name}` : `已加载 ${selected.name}（使用默认 YAML 参数）`);
+            showNotice(waypointLoadError || loadNotice, Boolean(waypointLoadError));
         } catch (error) {
             showNotice(error instanceof Error ? error.message : '地图加载失败', true);
         } finally {
@@ -529,6 +845,32 @@ function App() {
         }
     };
 
+    const openSelectedWaypoints = async (entry?: BoardEntry) => {
+        const selected = entry || browser.selected;
+        if (!loaded) {
+            showNotice('请先打开地图，再打开地点文件', true);
+            return;
+        }
+        if (!selected || browser.loading || browserOperationRef.current || !/\.ya?ml$/i.test(selected.name)) return;
+        browserOperationRef.current = true;
+        setBrowser((current) => ({ ...current, loading: true }));
+        try {
+            const response = await fetchFile(selected, '读取地点文件失败');
+            const loadError = applyWaypointsText(await response.text(), selected.path);
+            if (loadError) throw new Error(loadError);
+            setMode('waypoints');
+            setMarkingSlotId(null);
+            closeBrowser();
+            window.setTimeout(() => canvasRef.current?.resetView(), 0);
+            showNotice(`已加载地点 ${selected.name}`);
+        } catch (error) {
+            showNotice(error instanceof Error ? error.message : '地点文件加载失败', true);
+        } finally {
+            browserOperationRef.current = false;
+            setBrowser((current) => ({ ...current, loading: false }));
+        }
+    };
+
     const resetToOpenedMap = useCallback(() => {
         const openedMap = openedMapRef.current;
         if (!openedMap) return;
@@ -539,6 +881,14 @@ function App() {
         setMaskFuture([]);
         setMaskHistoryTruncated(false);
         maskEditStartRef.current = null;
+        const reopenedWaypoints = openedWaypointsRef.current.map((waypoint) => ({ ...waypoint }));
+        setWaypointEntries(reopenedWaypoints);
+        setDraftSlotNames({ ...openedSlotNamesRef.current });
+        setWaypointHistory([]);
+        setWaypointFuture([]);
+        setWaypointsDirty(false);
+        setMarkingSlotId(null);
+        setExpandedSlotId(null);
         setMapDirty(false);
         setMaskDirty(false);
         showNotice('已重置地图');
@@ -557,14 +907,51 @@ function App() {
         if (!response.ok) throw new Error(payload.error || '保存失败');
     };
 
+    const saveSingleFile = async (path: string, content: Uint8Array) => {
+        const response = await fetch('/api/save', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path, contentBase64: encodeBase64(content) }),
+        });
+        const payload = await response.json() as { error?: string };
+        if (!response.ok) throw new Error(payload.error || '保存失败');
+    };
+
     const saveSelectedDirectory = async () => {
         if (!browser.saveKind || !loaded || browserOperationRef.current) return;
         browserOperationRef.current = true;
         setBrowser((current) => ({ ...current, loading: true }));
         const base = safeBaseName(browser.filename);
-        const data = browser.saveKind === 'map' ? gridData : maskData || new Int8Array(width * height).fill(CELL_FREE);
-        const pgmName = `${base}.pgm`;
         try {
+            if (browser.saveKind === 'waypoints') {
+                // 地点层只保存单个 YAML，位姿换算基于当前地图元数据。
+                const file: WaypointFile = {
+                    version: WAYPOINTS_FILE_VERSION,
+                    frameId: WAYPOINTS_DEFAULT_FRAME,
+                    mapBinding: mapBindingFromMetadata(metadata, width, height, sourcePath.split('/').pop() || metadata.image),
+                    waypoints: PRESET_SLOTS.flatMap((slot) => waypointEntries.filter((waypoint) => waypoint.id === slot.id)),
+                };
+                const yamlPath = joinBoardPath(browser.path, `${base}.yaml`);
+                await saveSingleFile(yamlPath, new TextEncoder().encode(serializeWaypointsYaml(file)));
+                setWaypointsDirty(false);
+                setWaypointsPath(yamlPath);
+                openedWaypointsRef.current = waypointEntries.map((waypoint) => ({ ...waypoint }));
+                const savedSlotNames = Object.fromEntries(waypointEntries.map((waypoint) => [waypoint.id, waypoint.name]));
+                openedSlotNamesRef.current = savedSlotNames;
+                setDraftSlotNames((names) => {
+                    const next = { ...names, ...savedSlotNames };
+                    // 文件现在已存在：未修改的示例名退回通用名，用户自定义草稿仍留在本次编辑中。
+                    for (const id of EXAMPLE_SLOT_IDS) {
+                        if (!(id in savedSlotNames) && next[id] === defaultSlotName(id)) delete next[id];
+                    }
+                    return next;
+                });
+                closeBrowser();
+                showNotice(`已保存到 ${yamlPath}`);
+                return;
+            }
+            const data = browser.saveKind === 'map' ? gridData : maskData || new Int8Array(width * height).fill(CELL_FREE);
+            const pgmName = `${base}.pgm`;
             const pgmPath = joinBoardPath(browser.path, pgmName);
             const yamlPath = joinBoardPath(browser.path, `${base}.yaml`);
             await savePair(
@@ -605,7 +992,8 @@ function App() {
 
     const handleMode = (nextMode: EditMode) => {
         setMode(nextMode);
-        if (nextMode === 'mask') {
+        if (nextMode !== 'waypoints') setMarkingSlotId(null);
+        if (nextMode === 'mask' || nextMode === 'waypoints') {
             if (tool === 'unknown') setTool('pencil');
             if (!maskData) setMaskData(new Int8Array(width * height).fill(CELL_FREE));
             if (!maskData) setMaskOccupiedCount(0);
@@ -634,7 +1022,9 @@ function App() {
             const isYaml = entry.type === 'file' && /\.ya?ml$/i.test(entry.name);
             const stem = entry.name.replace(/\.(?:pgm|ya?ml)$/i, '').toLowerCase();
             const hasPair = isPgm ? yamlStems.has(stem) : isYaml && pgmStems.has(stem);
-            const pairLabel = isPgm && !hasPair ? '缺少 YAML' : isYaml && !hasPair ? '缺少 PGM' : '';
+            // waypoints.yaml 是独立的地点文件，不参与 PGM/YAML 配对校验。
+            const isWaypointsFile = isYaml && stem === WAYPOINTS_DEFAULT_FILENAME.replace(/\.ya?ml$/i, '').toLowerCase();
+            const pairLabel = isPgm && !hasPair ? '缺少 YAML' : isYaml && !hasPair ? (isWaypointsFile ? '地点文件' : '缺少 PGM') : '';
             const selected = browser.selected?.path === entry.path;
             return (
                 <button
@@ -647,33 +1037,44 @@ function App() {
                     onDoubleClick={() => {
                         if (browser.mode === 'open' && isPgm) {
                             void (browser.pathKind === 'open-mask' ? openSelectedMask(entry) : openSelectedMap(entry));
+                        } else if (browser.mode === 'open' && browser.pathKind === 'open-waypoints' && isYaml) {
+                            void openSelectedWaypoints(entry);
                         }
                     }}
                     className={clsx('flex w-full items-center gap-3 rounded px-3 py-2 text-left text-sm transition-colors', selected ? 'bg-black text-white' : 'hover:bg-gray-100')}
                 >
                     {entry.type === 'directory' ? <Folder size={17} /> : <File size={17} />}
                     <span className="min-w-0 flex-1 truncate">{entry.name}</span>
-                    {pairLabel && <span className={clsx('shrink-0 text-xs', selected ? 'text-white' : hasPair ? 'text-emerald-600' : 'text-amber-600')}>{pairLabel}</span>}
+                    {pairLabel && <span className={clsx('shrink-0 text-xs', selected ? 'text-white' : isWaypointsFile ? 'text-sky-600' : hasPair ? 'text-emerald-600' : 'text-amber-600')}>{pairLabel}</span>}
                     <span className={clsx('text-xs', selected ? 'text-white' : 'text-gray-400')}>{entry.type === 'directory' ? '目录' : formatSize(entry.size)}</span>
                 </button>
             );
         });
     };
 
-    const canOpenSelected = browser.selected?.type === 'file' && /\.pgm$/i.test(browser.selected.name) && (browser.pathKind !== 'open-mask' || loaded);
+    const canOpenSelected = browser.selected?.type === 'file' && (
+        browser.pathKind === 'open-waypoints'
+            ? /\.ya?ml$/i.test(browser.selected.name) && loaded
+            : /\.pgm$/i.test(browser.selected.name) && (browser.pathKind !== 'open-mask' || loaded)
+    );
     const canDeleteSelected = browser.selected?.type === 'file' && /\.(?:pgm|ya?ml)$/i.test(browser.selected.name);
 
     return (
         <div className="flex h-screen flex-col overflow-hidden bg-white text-black">
             <header className="z-10 flex h-16 shrink-0 items-center justify-between gap-4 border-b border-gray-200 px-6">
-                <h1 className="shrink-0 text-xl font-bold tracking-tight">Occupancy Editor</h1>
+                <div className="flex shrink-0 items-center gap-2">
+                    <h1 className="text-xl font-bold tracking-tight">Occupancy Editor</h1>
+                    <a href="https://github.com/clhchan/occupancy-editor" target="_blank" rel="noopener noreferrer" aria-label="GitHub" className="inline-flex h-8 w-8 items-center justify-center rounded-md text-gray-500 transition-colors hover:bg-gray-100 hover:text-black focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-black">
+                        <Github size={19} />
+                    </a>
+                </div>
                 <div className="flex min-w-0 items-center gap-1 rounded-md border border-gray-200 bg-white p-1 shadow-sm">
-                    <ToolbarBtn icon={<Pencil size={18} />} active={tool === 'pencil'} disabled={!loaded} onClick={() => setTool('pencil')} onWheel={handleBrushToolWheel} title="画笔" />
-                    <ToolbarBtn icon={<Square size={18} />} active={tool === 'rect'} disabled={!loaded} onClick={() => setTool('rect')} title="矩形" />
-                    <ToolbarBtn icon={<Minus size={18} className="scale-x-150" />} active={tool === 'line'} disabled={!loaded} onClick={() => setTool('line')} title="连线" />
-                    <ToolbarBtn icon={<Eraser size={18} />} active={tool === 'eraser'} disabled={!loaded} onClick={() => setTool('eraser')} onWheel={handleBrushToolWheel} title="橡皮擦" />
+                    <ToolbarBtn icon={<Pencil size={18} />} active={tool === 'pencil'} disabled={!loaded || mode === 'waypoints'} onClick={() => setTool('pencil')} onWheel={handleBrushToolWheel} title="画笔" />
+                    <ToolbarBtn icon={<Square size={18} />} active={tool === 'rect'} disabled={!loaded || mode === 'waypoints'} onClick={() => setTool('rect')} title="矩形" />
+                    <ToolbarBtn icon={<Minus size={18} className="scale-x-150" />} active={tool === 'line'} disabled={!loaded || mode === 'waypoints'} onClick={() => setTool('line')} title="连线" />
+                    <ToolbarBtn icon={<Eraser size={18} />} active={tool === 'eraser'} disabled={!loaded || mode === 'waypoints'} onClick={() => setTool('eraser')} onWheel={handleBrushToolWheel} title="橡皮擦" />
                     <ToolbarBtn icon={<CircleHelp size={18} />} active={tool === 'unknown'} disabled={!loaded || mode !== 'map'} onClick={() => setTool('unknown')} title="未知区域" />
-                    <label className={clsx('flex items-center gap-1 border-l border-gray-200 pl-2 text-xs text-gray-500', (!loaded || !['pencil', 'eraser', 'unknown'].includes(tool)) && 'opacity-40')} title="画笔大小"><input type="number" min={1} max={100} step={1} value={brushSize} disabled={!loaded || !['pencil', 'eraser', 'unknown'].includes(tool)} onChange={(event) => setBrushSize(Math.min(100, Math.max(1, Number(event.target.value) || 1)))} onWheel={(event) => { if (document.activeElement !== event.currentTarget) return; event.preventDefault(); const direction = event.deltaY < 0 ? 1 : -1; setBrushSize((current) => Math.min(100, Math.max(1, current + direction))); }} className="w-12 rounded border border-gray-300 px-1.5 py-1 text-center text-xs text-gray-700 outline-none focus:border-black disabled:cursor-not-allowed disabled:bg-gray-50" aria-label="画笔大小" /><span>px</span></label>
+                    <label className={clsx('flex items-center gap-1 border-l border-gray-200 pl-2 text-xs text-gray-500', (!loaded || !['pencil', 'eraser', 'unknown'].includes(tool) || mode === 'waypoints') && 'opacity-40')} title="画笔大小"><input type="number" min={1} max={100} step={1} value={brushSize} disabled={!loaded || mode === 'waypoints' || !['pencil', 'eraser', 'unknown'].includes(tool)} onChange={(event) => setBrushSize(Math.min(100, Math.max(1, Number(event.target.value) || 1)))} onWheel={(event) => { if (document.activeElement !== event.currentTarget) return; event.preventDefault(); const direction = event.deltaY < 0 ? 1 : -1; setBrushSize((current) => Math.min(100, Math.max(1, current + direction))); }} className="w-12 rounded border border-gray-300 px-1.5 py-1 text-center text-xs text-gray-700 outline-none focus:border-black disabled:cursor-not-allowed disabled:bg-gray-50" aria-label="画笔大小" /><span>px</span></label>
                     <span className="mx-1 h-6 w-px bg-gray-200" />
                     <ToolbarBtn icon={<Undo size={18} />} disabled={!activeCanUndo} onClick={handleUndo} repeatOnHold title="撤销" />
                     <ToolbarBtn icon={<Redo size={18} />} disabled={!activeCanRedo} onClick={handleRedo} repeatOnHold title="重做" />
@@ -683,14 +1084,31 @@ function App() {
                 <div className="flex shrink-0 items-center gap-2">
                     <button type="button" onClick={() => openBrowser('open')} className="flex items-center gap-2 rounded-md border border-gray-300 bg-gray-50 px-3 py-2 text-sm font-medium text-gray-700 transition-colors hover:bg-gray-100"><Upload size={16} />打开地图</button>
                     <button type="button" disabled={!loaded} onClick={() => openBrowser('open', 'mask')} className="flex items-center gap-2 rounded-md border border-gray-300 bg-gray-50 px-3 py-2 text-sm font-medium text-gray-700 transition-colors hover:bg-gray-100 disabled:cursor-not-allowed disabled:opacity-30"><Upload size={16} />打开掩码</button>
+                    <button type="button" disabled={!loaded} onClick={() => openBrowser('open', 'waypoints')} className="flex items-center gap-2 rounded-md border border-gray-300 bg-gray-50 px-3 py-2 text-sm font-medium text-gray-700 transition-colors hover:bg-gray-100 disabled:cursor-not-allowed disabled:opacity-30"><MapPin size={16} />打开地点</button>
                     <button type="button" disabled={!loaded} onClick={() => openBrowser('save', 'map')} className="flex items-center gap-2 rounded-md bg-black px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-gray-800 disabled:cursor-not-allowed disabled:opacity-30"><Download size={16} />保存地图</button>
                     <button type="button" disabled={!loaded} onClick={() => openBrowser('save', 'mask')} className="flex items-center gap-2 rounded-md bg-black px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-gray-800 disabled:cursor-not-allowed disabled:opacity-30"><Download size={16} />保存掩码</button>
+                    <button type="button" disabled={!loaded} onClick={() => openBrowser('save', 'waypoints')} className="flex items-center gap-2 rounded-md bg-black px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-gray-800 disabled:cursor-not-allowed disabled:opacity-30"><Download size={16} />保存地点</button>
                 </div>
             </header>
 
             <div className="flex min-h-0 flex-1 overflow-hidden">
-                <main className="relative min-w-0 flex-1 overflow-hidden bg-gray-100">
-                    {loaded && <GridCanvas ref={canvasRef} width={width} height={height} data={activeData} backgroundData={mode === 'mask' ? gridData : undefined} tool={tool} brushSize={brushSize} onUpdate={handleGridUpdate} />}
+                <main ref={canvasAreaRef} className="relative min-w-0 flex-1 overflow-hidden bg-gray-100">
+                    {loaded && <GridCanvas
+                        ref={canvasRef}
+                        width={width}
+                        height={height}
+                        data={activeData}
+                        backgroundData={mode !== 'map' ? gridData : undefined}
+                        tool={mode === 'waypoints' ? 'none' : tool}
+                        brushSize={brushSize}
+                        onUpdate={handleGridUpdate}
+                        markingSlot={markingSlot}
+                        placedWaypoints={placedWaypoints}
+                        baseMapData={gridData}
+                        onPlaceWaypoint={handlePlaceWaypoint}
+                        onCancelMarking={exitMarking}
+                        markerArrowCells={markerArrowCellsValue}
+                    />}
                     {!loaded && (
                         <div className="absolute inset-0 z-10 grid place-items-center bg-gray-100 px-6">
                             <div className="flex max-w-sm flex-col items-center text-center">
@@ -719,6 +1137,7 @@ function App() {
                         <div className="flex rounded bg-gray-200 p-1">
                             <button type="button" disabled={!loaded} onClick={() => handleMode('map')} className={clsx('flex-1 rounded py-1.5 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40', mode === 'map' ? 'bg-white text-black shadow-sm' : 'text-gray-600 hover:text-black')}>原图层</button>
                             <button type="button" disabled={!loaded} onClick={() => handleMode('mask')} className={clsx('flex-1 rounded py-1.5 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40', mode === 'mask' ? 'bg-white text-black shadow-sm' : 'text-gray-600 hover:text-black')}>禁行区层</button>
+                            <button type="button" disabled={!loaded} onClick={() => handleMode('waypoints')} className={clsx('flex-1 rounded py-1.5 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40', mode === 'waypoints' ? 'bg-white text-black shadow-sm' : 'text-gray-600 hover:text-black')}>地点层</button>
                         </div>
                     </section>
                     <div className="min-h-0 flex-1 space-y-6 overflow-y-auto p-4">
@@ -728,7 +1147,7 @@ function App() {
                                 <div className="flex justify-between gap-3"><dt className="text-gray-400">文件</dt><dd className="truncate font-medium text-gray-700">{sourcePath.split('/').pop() || '未加载'}</dd></div>
                                 <div className="flex justify-between gap-3"><dt className="text-gray-400">分辨率</dt><dd className="font-medium text-gray-700">{metadata.resolution} m/px</dd></div>
                                 <div className="flex justify-between gap-3"><dt className="text-gray-400">原点</dt><dd className="font-medium text-gray-700">{metadata.origin.x}, {metadata.origin.y}</dd></div>
-                                <div className="flex justify-between gap-3"><dt className="text-gray-400">当前图层</dt><dd className="font-medium text-gray-700">{mode === 'map' ? '原图层' : '禁行区层'}</dd></div>
+                                <div className="flex justify-between gap-3"><dt className="text-gray-400">当前图层</dt><dd className="font-medium text-gray-700">{mode === 'map' ? '原图层' : mode === 'mask' ? '禁行区层' : '地点层'}</dd></div>
                             </dl>
                         </section>
                         <section>
@@ -738,6 +1157,103 @@ function App() {
                                 <div className="min-w-0 flex-1"><div className="truncate text-sm font-medium text-gray-700">{maskPath.split('/').pop() || 'keepout_mask'}</div><div className="mt-1 text-xs text-gray-400">{maskOccupiedCount.toLocaleString()} 个禁行栅格</div></div>
                             </div>
                         </section>
+                        <section ref={waypointsPanelRef}>
+                            <div className="mb-3 flex items-center justify-between gap-3 text-xs font-bold uppercase tracking-wider text-gray-500">
+                                <span>家庭地点</span>
+                                <span className="flex items-center gap-2 font-normal normal-case tracking-normal">
+                                    <span className="text-gray-400">{waypointEntries.length}/{PRESET_SLOTS.length} 已标记</span>
+                                    <ToolbarBtn
+                                        icon={waypointsVisible ? <Eye size={15} /> : <EyeOff size={15} />}
+                                        onClick={() => setWaypointsVisible((visible) => !visible)}
+                                        title={waypointsVisible ? '隐藏地图上的地点标记' : '显示地图上的地点标记'}
+                                    />
+                                </span>
+                            </div>
+                            <div className="space-y-2">
+                                {PRESET_SLOTS.map((slot) => {
+                                    const waypoint = waypointEntries.find((item) => item.id === slot.id);
+                                    const name = waypoint?.name ?? draftSlotNames[slot.id] ?? `地点 ${slot.id}`;
+                                    const isMarking = markingSlot?.id === slot.id;
+                                    const isExpanded = expandedSlotId === slot.id;
+                                    return (
+                                        <div
+                                            key={slot.id}
+                                            data-waypoint-card
+                                            onClick={() => {
+                                                if (!loaded) return;
+                                                if (mode === 'waypoints' && markingSlotId) switchMarking(slot.id);
+                                                else startMarking(slot.id);
+                                            }}
+                                            onDoubleClick={(event) => {
+                                                if (!loaded) return;
+                                                event.stopPropagation();
+                                                startMarking(slot.id);
+                                                setExpandedSlotId((current) => (current === slot.id ? null : slot.id));
+                                            }}
+                                            onFocusCapture={() => {
+                                                if (!loaded) return;
+                                                // 已在标记态时聚焦输入框不重置编辑框状态。
+                                                if (mode === 'waypoints' && markingSlotId) return;
+                                                startMarking(slot.id);
+                                            }}
+                                            className={clsx(
+                                                'rounded border p-3 transition-colors',
+                                                loaded ? 'cursor-pointer' : 'cursor-not-allowed opacity-60',
+                                                isMarking ? 'border-black bg-gray-50 shadow-sm' : 'border-gray-200 hover:border-gray-400',
+                                            )}
+                                            title={loaded ? '单击选中并拖动地图标记；双击编辑名称和坐标' : undefined}
+                                        >
+                                            <div className="flex items-center gap-2">
+                                                <span className="h-3 w-3 shrink-0 rounded-full" style={{ backgroundColor: slot.color }} />
+                                                <span className="shrink-0 font-mono text-xs text-gray-400">{slot.id}</span>
+                                                {isExpanded ? (
+                                                    <input
+                                                        value={name}
+                                                        disabled={!loaded}
+                                                        onClick={(event) => event.stopPropagation()}
+                                                        onDoubleClick={(event) => event.stopPropagation()}
+                                                        onChange={(event) => updateSlotName(slot.id, event.target.value)}
+                                                        onKeyDown={(event) => {
+                                                            if (event.key === 'Enter') {
+                                                                event.currentTarget.blur();
+                                                                exitMarking();
+                                                            }
+                                                        }}
+                                                        className="min-w-0 flex-1 cursor-text rounded border border-transparent px-1 py-0.5 text-sm font-medium text-gray-800 hover:border-gray-300 focus:border-black focus:outline-none disabled:opacity-50"
+                                                        aria-label={`${slot.id} 显示名称`}
+                                                    />
+                                                ) : (
+                                                    <span className="min-w-0 flex-1 truncate text-sm font-medium text-gray-800">{name}</span>
+                                                )}
+                                                {waypoint && <span onClick={(event) => event.stopPropagation()} onDoubleClick={(event) => event.stopPropagation()}>
+                                                    <ToolbarBtn icon={<Trash2 size={14} />} onClick={() => clearWaypoint(slot.id)} title="清除该地点" />
+                                                </span>}
+                                            </div>
+                                            {waypoint && isExpanded ? (
+                                                <div className="mt-2 space-y-1.5" onClick={(event) => event.stopPropagation()} onDoubleClick={(event) => event.stopPropagation()}>
+                                                    <div className="flex items-center gap-1.5 text-xs text-gray-500">
+                                                        <span className="shrink-0">x</span>
+                                                        <NumberField value={waypoint.position.x} digits={4} onEnterDone={exitMarking} onCommit={(x) => updateWaypointPose(slot.id, { x })} />
+                                                        <span className="shrink-0">y</span>
+                                                        <NumberField value={waypoint.position.y} digits={4} onEnterDone={exitMarking} onCommit={(y) => updateWaypointPose(slot.id, { y })} />
+                                                        <span className="shrink-0" title="朝向角度（度）">朝向°</span>
+                                                        <NumberField value={waypoint.yawDeg} digits={2} onEnterDone={exitMarking} onCommit={(yawDeg) => updateWaypointPose(slot.id, { yawDeg })} />
+                                                    </div>
+                                                </div>
+                                            ) : waypoint ? (
+                                                <div className="mt-1.5 font-mono text-xs text-gray-500">
+                                                    x {waypoint.position.x.toFixed(4)} · y {waypoint.position.y.toFixed(4)} · 朝向 {waypoint.yawDeg.toFixed(2)}°
+                                                </div>
+                                            ) : (
+                                                <div className="mt-1.5 text-xs text-gray-400">{isMarking ? '拖动地图确定位置和朝向' : '未标记，不会保存'}</div>
+                                            )}
+                                            {waypoint && isMarking && <div className="mt-1.5 text-xs font-medium text-gray-700">拖动地图重新标记位置和朝向</div>}
+                                        </div>
+                                    );
+                                })}
+                            </div>
+                            {waypointsPath && <p className="mt-2 truncate text-xs text-gray-400" title={waypointsPath}>文件 {waypointsPath.split('/').pop()}</p>}
+                        </section>
                     </div>
                 </aside>
             </div>
@@ -746,7 +1262,7 @@ function App() {
                 <div className="fixed inset-0 z-50 grid place-items-center bg-black/50 p-5" role="dialog" aria-modal="true">
                     <div className="flex max-h-[min(720px,calc(100vh-40px))] w-[min(680px,100%)] flex-col overflow-hidden rounded-lg bg-white shadow-2xl">
                         <div className="flex items-center justify-between border-b border-gray-200 px-5 py-4">
-                            <div><h2 className="font-semibold">{browser.mode === 'open' ? (browser.pathKind === 'open-mask' ? '选择掩码文件' : '选择地图文件') : '保存文件'}</h2><p className="mt-1 text-xs text-gray-400">{browser.mode === 'open' ? (browser.pathKind === 'open-mask' ? '选择 PGM 文件，将匹配同名 YAML 并载入禁行区层' : '选择 PGM 文件及同名 YAML，载入原图层') : '选择保存路径'}</p></div>
+                            <div><h2 className="font-semibold">{browser.mode === 'open' ? (browser.pathKind === 'open-mask' ? '选择掩码文件' : browser.pathKind === 'open-waypoints' ? '选择地点文件' : '选择地图文件') : '保存文件'}</h2><p className="mt-1 text-xs text-gray-400">{browser.mode === 'open' ? (browser.pathKind === 'open-mask' ? '选择 PGM 文件，将匹配同名 YAML 并载入禁行区层' : browser.pathKind === 'open-waypoints' ? '选择 YAML 地点文件，需与当前地图尺寸、分辨率和原点一致' : '选择 PGM 文件及同名 YAML，载入原图层') : '选择保存路径'}</p></div>
                             <button type="button" onClick={closeBrowser} className="rounded p-1 text-gray-400 transition-colors hover:bg-gray-100 hover:text-black" title="关闭"><X size={18} /></button>
                         </div>
                         {notice && !notice.error && <NoticeBanner notice={notice} embedded />}
@@ -755,13 +1271,18 @@ function App() {
                             <code className="min-w-0 flex-1 truncate text-xs text-gray-600">{browser.root ? `${browser.root}${browser.path === '.' ? '' : `/${browser.path}`}` : browser.path}</code>
                             <button type="button" disabled={browser.loading} onClick={() => void loadDirectory(browser.path, browser.pathKind)} className="rounded p-1 text-gray-600 hover:bg-gray-200 disabled:opacity-30" title="刷新"><RefreshCw size={16} /></button>
                         </div>
-                        {browser.mode === 'save' && <div className="border-b border-gray-200 px-5 py-3"><div className="flex flex-wrap items-center gap-3"><label htmlFor="serverSaveName" className="text-xs text-gray-500">文件名</label><input id="serverSaveName" value={browser.filename} onChange={(event) => setBrowser((current) => ({ ...current, filename: event.target.value }))} className="min-w-0 flex-1 rounded border border-gray-300 px-3 py-2 text-sm outline-none focus:border-black" /><span className="text-xs text-gray-400">.pgm + .yaml</span></div>{saveConflict && <p className="mt-2 text-xs text-amber-600">同名文件已存在，保存将覆盖</p>}</div>}
+                        {browser.mode === 'save' && <div className="border-b border-gray-200 px-5 py-3"><div className="flex flex-wrap items-center gap-3"><label htmlFor="serverSaveName" className="text-xs text-gray-500">文件名</label><input id="serverSaveName" value={browser.filename} onChange={(event) => setBrowser((current) => ({ ...current, filename: event.target.value }))} className="min-w-0 flex-1 rounded border border-gray-300 px-3 py-2 text-sm outline-none focus:border-black" /><span className="text-xs text-gray-400">{browser.saveKind === 'waypoints' ? '.yaml' : '.pgm + .yaml'}</span></div>{saveConflict && <p className="mt-2 text-xs text-amber-600">同名文件已存在，保存将覆盖</p>}</div>}
                         <div className="min-h-[260px] flex-1 overflow-y-auto p-3">{renderEntries()}</div>
-                        <div className="flex items-center justify-between gap-4 border-t border-gray-200 px-5 py-4"><div className="min-w-0 truncate text-xs text-gray-500">{browser.mode === 'open' ? (browser.selected ? browser.selected.name : '未选择文件') : `保存到 ${browser.root ? `${browser.root}${browser.path === '.' ? '' : `/${browser.path}`}` : browser.path}`}</div><div className="flex shrink-0 items-center gap-2"><button type="button" disabled={browser.loading || !canDeleteSelected} onClick={() => void deleteSelectedFile()} className="flex items-center gap-1.5 rounded border border-red-200 px-3 py-2 text-sm font-medium text-red-700 transition-colors hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-30" title="删除选中的 PGM/YAML 文件"><Trash2 size={16} />删除文件</button><button type="button" disabled={browser.loading || (browser.mode === 'open' ? !canOpenSelected : !browser.filename.trim())} onClick={() => { if (browser.mode !== 'open') { void saveSelectedDirectory(); return; } if (browser.pathKind === 'open-mask') void openSelectedMask(); else void openSelectedMap(); }} className="shrink-0 rounded bg-black px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-gray-800 disabled:cursor-not-allowed disabled:opacity-30">{browser.mode === 'open' ? (browser.pathKind === 'open-mask' ? '打开掩码' : '打开地图') : '保存到此目录'}</button></div></div>
+                        <div className="flex items-center justify-between gap-4 border-t border-gray-200 px-5 py-4"><div className="min-w-0 truncate text-xs text-gray-500">{browser.mode === 'open' ? (browser.selected ? browser.selected.name : '未选择文件') : `保存到 ${browser.root ? `${browser.root}${browser.path === '.' ? '' : `/${browser.path}`}` : browser.path}`}</div><div className="flex shrink-0 items-center gap-2"><button type="button" disabled={browser.loading || !canDeleteSelected} onClick={() => void deleteSelectedFile()} className="flex items-center gap-1.5 rounded border border-red-200 px-3 py-2 text-sm font-medium text-red-700 transition-colors hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-30" title="删除选中的 PGM/YAML 文件"><Trash2 size={16} />删除文件</button><button type="button" disabled={browser.loading || (browser.mode === 'open' ? !canOpenSelected : !browser.filename.trim())} onClick={() => { if (browser.mode !== 'open') { void saveSelectedDirectory(); return; } if (browser.pathKind === 'open-mask') void openSelectedMask(); else if (browser.pathKind === 'open-waypoints') void openSelectedWaypoints(); else void openSelectedMap(); }} className="shrink-0 rounded bg-black px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-gray-800 disabled:cursor-not-allowed disabled:opacity-30">{browser.mode === 'open' ? (browser.pathKind === 'open-mask' ? '打开掩码' : browser.pathKind === 'open-waypoints' ? '打开地点文件' : '打开地图') : '保存到此目录'}</button></div></div>
                     </div>
                 </div>
             )}
-            {notice && (!browser.open || notice.error) && <NoticeBanner notice={notice} />}
+            {markingSlot && (
+                <div className="pointer-events-none fixed left-1/2 top-20 z-[60] max-w-[calc(100vw-2rem)] -translate-x-1/2 rounded-md bg-black/75 px-4 py-2 text-xs font-medium text-white shadow-lg">
+                    标记「{waypointEntries.find((waypoint) => waypoint.id === markingSlot.id)?.name ?? draftSlotNames[markingSlot.id] ?? `地点 ${markingSlot.id}`}」：拖动地图确定位置和朝向；单击不保存；双击面板编辑坐标；点击空白处退出
+                </div>
+            )}
+            {notice && (!browser.open || notice.error) && <NoticeBanner notice={notice} topClass={markingSlot ? 'top-36' : 'top-20'} />}
         </div>
     );
 }
