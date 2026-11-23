@@ -114,6 +114,19 @@ npm run dev
 
 Select **打开地图** (Open Map) to load a `.pgm` file. The editor looks for a same-name YAML file in the same directory and uses default map parameters if it is missing. Once the map is open, use any of the layers below as needed.
 
+### Resume the Previous Session
+
+After restarting the service, open the editor in the **same browser at the same address**. It reopens the last map and returns to the last active layer without asking you to browse for the file again. `localhost`, a LAN IP address, and different ports each have separate browser storage.
+
+Unsaved edits are kept as a local draft in the browser's IndexedDB. If you refresh or accidentally close the tab, you can restore the draft the next time you open the editor. Restoring a draft **does not write to disk**. Use the layer's Save button to update the files used by the robot. A private browsing session, clearing site data, or switching browsers can make the draft unavailable; it is not a backup.
+
+To check recovery with the sample map:
+
+1. Open `test_maps/map.pgm` and switch to **禁行区层** (Keepout Layer). Refresh and check that the same map and layer reopen.
+2. Draw a distinctive keepout area in a free part of the map and release the mouse. Do not select **保存掩码** (Save Mask) yet.
+3. Close the tab, stop and restart the service, then reopen the editor at the original address. Choose to restore the draft and check that the keepout area is still there.
+4. Select **保存掩码** (Save Mask) and export under a new name, such as `recovery_test`. Open the new mask to verify that it contains the area you drew. The sample map files should be unchanged.
+
 ### 🗺️ Map Layer
 
 - Select **原图层** (Map Layer) and edit occupancy cells with the drawing tools. Select **保存地图** (Save Map) to write a PGM/YAML pair.

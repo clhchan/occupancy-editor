@@ -82,21 +82,21 @@ export function useGrid({ initialWidth, initialHeight, initialResolution }: UseG
         if (commit) saveToHistory({ width: newWidth, height: newHeight, data: newData, metadata });
     }, [width, height, metadata, saveToHistory]);
 
-    const replaceGrid = useCallback((newData: GridData, newWidth: number, newHeight: number, newMetadata: GridMetadata) => {
+    const replaceGrid = useCallback((newData: GridData, newWidth: number, newHeight: number, newMetadata: GridMetadata, draft?: GridData | null) => {
         const nextData = new Int8Array(newData);
         const nextMetadata: GridMetadata = {
             ...newMetadata,
             origin: { ...newMetadata.origin },
         };
         const nextState: GridState = { width: newWidth, height: newHeight, data: nextData, metadata: nextMetadata };
-        setGridData(nextData);
+        setGridData(draft ?? nextData);
         setWidth(newWidth);
         setHeight(newHeight);
         setMetadata(nextMetadata);
         // Loading a map establishes a new editing baseline. The previous
         // blank canvas must not remain reachable through Undo.
-        historyRef.current = [nextState];
-        historyIndexRef.current = 0;
+        historyRef.current = draft ? [nextState, { ...nextState, data: draft }] : [nextState];
+        historyIndexRef.current = historyRef.current.length - 1;
         setVersion(v => v + 1);
     }, []);
 
@@ -144,6 +144,7 @@ export function useGrid({ initialWidth, initialHeight, initialResolution }: UseG
         width,
         height,
         gridData,
+        committedData: historyRef.current[historyIndexRef.current].data,
         metadata,
         updateGrid,
         replaceGrid,

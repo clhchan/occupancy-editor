@@ -26,6 +26,37 @@ afterEach(() => {
 });
 
 describe('地点卡片', () => {
+    it('手动重新打开地点文件会替换当前编辑，但不写回文件', async () => {
+        const metadata = { resolution: 0.05, origin: { x: 0, y: 0, theta: 0 } };
+        const yaml = serializeWaypointsYaml({
+            version: 1, frameId: 'map',
+            mapBinding: { image: 'map.pgm', resolution: 0.05, origin: [0, 0, 0], width: 4, height: 4 },
+            waypoints: [createWaypoint({ id: 'A', name: '玄关', aliases: [], col: 1, row: 1, yawRad: 0, height: 4, metadata })],
+        });
+        const entries = ['map.pgm', 'waypoints.yaml'].map(name => ({ name, path: name, type: 'file' }));
+        const requests = vi.fn(async (input: RequestInfo | URL, options?: RequestInit) => {
+            expect(options?.method ?? 'GET').toBe('GET');
+            const url = String(input);
+            if (url.startsWith('/api/files?')) return new Response(JSON.stringify({ root: '/maps', path: '.', parent: null, entries }));
+            if (url === '/api/file?path=map.pgm') return new Response('P2\n4 4\n255\n' + Array(16).fill('255').join(' '));
+            if (url === '/api/file?path=waypoints.yaml') return new Response(yaml);
+            throw new Error(`Unexpected request: ${url}`);
+        });
+        vi.stubGlobal('fetch', requests);
+        render(<App />);
+        fireEvent.click(screen.getAllByRole('button', { name: '打开地图' })[0]);
+        fireEvent.doubleClick(await screen.findByRole('button', { name: /map\.pgm/ }));
+        await screen.findByText('1/10 已标记');
+        fireEvent.click(screen.getByText('地点 B'));
+        fireEvent.click(screen.getByTestId('map'));
+        await screen.findByText('2/10 已标记');
+        fireEvent.click(screen.getByRole('button', { name: '打开地点' }));
+        fireEvent.doubleClick(await screen.findByRole('button', { name: /waypoints\.yaml/ }));
+        await screen.findByText('1/10 已标记');
+        expect(screen.getByText('玄关')).toBeTruthy();
+        expect(screen.queryByText('未保存修改')).toBeNull();
+    });
+
     it('切换卡片或点击空白处收起编辑框，保存时跳过未标记卡片', async () => {
         let savedYaml = '';
         const fileList = { root: '/home/xx', path: '.', parent: null, entries: [{ name: 'map.pgm', path: 'map.pgm', type: 'file' }] };

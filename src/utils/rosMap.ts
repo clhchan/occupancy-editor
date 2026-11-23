@@ -6,7 +6,7 @@ export interface ParsedPgm {
     pixels: Uint8Array;
 }
 
-const DEFAULT_METADATA: GridMetadata = {
+export const DEFAULT_METADATA: GridMetadata = {
     image: 'map.pgm',
     resolution: 0.05,
     origin: { x: 0, y: 0, theta: 0 },

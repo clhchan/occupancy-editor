@@ -9,6 +9,8 @@ import {
     File,
     Folder,
     Github,
+    HardDrive,
+    LoaderCircle,
     MapPin,
     Minus,
     Pencil,
@@ -18,6 +20,7 @@ import {
     Scan,
     Square,
     Trash2,
+    TriangleAlert,
     Undo,
     Upload,
     X,
@@ -28,7 +31,8 @@ import clsx from 'clsx';
 import { GridCanvas, type GridCanvasHandle } from './components/GridCanvas';
 import { useGrid } from './hooks/useGrid';
 import { CELL_FREE, CELL_OCCUPIED, type GridData, type GridMetadata } from './types';
-import { gridToPgm, gridToYaml, parseMapYaml, parsePgm, pgmToGrid } from './utils/rosMap';
+import { DEFAULT_METADATA, gridToPgm, gridToYaml, parseMapYaml, parsePgm, pgmToGrid } from './utils/rosMap';
+import { hasDraft, readBoundPoints, readDiskWorkspace, readWorkspace, sameBase, sameGrid, sameWaypoints, writeWorkspace, type EditMode, type Workspace } from './utils/workspace';
 import {
     EXAMPLE_SLOT_COUNT,
     PRESET_SLOTS,
@@ -37,11 +41,9 @@ import {
     WAYPOINTS_FILE_VERSION,
     createWaypoint,
     defaultSlotName,
-    describeBindingMismatch,
     mapBindingFromMetadata,
     markerArrowCells,
     normalizeDegrees,
-    parseWaypointsYaml,
     quaternionToYaw,
     serializeWaypointsYaml,
     worldToPixel,
@@ -51,7 +53,6 @@ import {
 } from './utils/waypoints';
 
 type Tool = 'pencil' | 'rect' | 'line' | 'eraser' | 'unknown';
-type EditMode = 'map' | 'mask' | 'waypoints';
 type BrowserMode = 'open' | 'save';
 type BrowserPathKind = 'open-map' | 'open-mask' | 'open-waypoints' | 'save-map' | 'save-mask' | 'save-waypoints';
 
@@ -91,16 +92,6 @@ const initialBrowser: BrowserState = {
     selected: null,
     filename: '',
     loading: false,
-};
-
-const defaultMetadata: GridMetadata = {
-    image: 'map.pgm',
-    resolution: 0.05,
-    origin: { x: 0, y: 0, theta: 0 },
-    negate: 0,
-    occupied_thresh: 0.65,
-    free_thresh: 0.196,
-    mode: 'trinary',
 };
 
 const BROWSER_PATH_KEYS: Record<BrowserPathKind, string> = {
@@ -299,6 +290,7 @@ function App() {
         width,
         height,
         gridData,
+        committedData,
         metadata,
         updateGrid,
         replaceGrid,
@@ -307,7 +299,6 @@ function App() {
         redo,
         canUndo,
         canRedo,
-        isAtInitial: isMapAtInitial,
     } = useGrid({ initialWidth: 50, initialHeight: 50, initialResolution: 0.05 });
 
     const canvasRef = useRef<GridCanvasHandle>(null);
@@ -317,7 +308,6 @@ function App() {
     const [maskData, setMaskData] = useState<GridData | null>(null);
     const [maskHistory, setMaskHistory] = useState<GridData[]>([]);
     const [maskFuture, setMaskFuture] = useState<GridData[]>([]);
-    const [maskHistoryTruncated, setMaskHistoryTruncated] = useState(false);
     const [maskOccupiedCount, setMaskOccupiedCount] = useState(0);
     const maskEditStartRef = useRef<GridData | null>(null);
     // --- 地点层状态 ---
@@ -325,7 +315,6 @@ function App() {
     const [draftSlotNames, setDraftSlotNames] = useState<Record<string, string>>(() => ({ ...EXAMPLE_SLOT_NAMES }));
     const [waypointHistory, setWaypointHistory] = useState<Waypoint[][]>([]);
     const [waypointFuture, setWaypointFuture] = useState<Waypoint[][]>([]);
-    const [waypointsDirty, setWaypointsDirty] = useState(false);
     const [waypointsPath, setWaypointsPath] = useState('');
     const [markingSlotId, setMarkingSlotId] = useState<string | null>(null);
     // 地点标记在地图上的显示开关，默认显示。
@@ -336,14 +325,24 @@ function App() {
     const openedSlotNamesRef = useRef<Record<string, string>>({ ...EXAMPLE_SLOT_NAMES });
     const [sourcePath, setSourcePath] = useState('');
     const [loaded, setLoaded] = useState(false);
-    const [mapDirty, setMapDirty] = useState(false);
-    const [maskDirty, setMaskDirty] = useState(false);
     const [maskPath, setMaskPath] = useState('');
     const [notice, setNotice] = useState<{ text: string; error?: boolean } | null>(null);
     const noticeTimerRef = useRef<number | null>(null);
     const [browser, setBrowser] = useState<BrowserState>(initialBrowser);
     const browserOperationRef = useRef(false);
     const openedMapRef = useRef<{ width: number; height: number; data: GridData; metadata: GridMetadata; maskData: GridData } | null>(null);
+    const [workspaceRoot, setWorkspaceRoot] = useState('');
+    const [starting, setStarting] = useState(() => typeof indexedDB !== 'undefined');
+    const [recovery, setRecovery] = useState<{ cached: Workspace; disk?: Workspace; warning: string } | null>(null);
+    const [cacheError, setCacheError] = useState('');
+    const [confirmedSession, setConfirmedSession] = useState<Workspace | null>(null);
+    const lastWrite = useRef<Workspace | null>(null);
+    const baseline = openedMapRef.current;
+    const basePoints = openedWaypointsRef.current;
+    const committedMask = maskEditStartRef.current ?? maskData;
+    const mapDirty = useMemo(() => Boolean(baseline && !sameGrid(committedData, baseline.data)), [baseline, committedData]);
+    const maskDirty = useMemo(() => Boolean(baseline && committedMask && !sameGrid(committedMask, baseline.maskData)), [baseline, committedMask]);
+    const waypointsDirty = useMemo(() => !sameWaypoints(waypointEntries, basePoints), [waypointEntries, basePoints]);
 
     const activeData = useMemo(() => {
         if (mode === 'map') return gridData;
@@ -384,10 +383,6 @@ function App() {
         return browser.entries.some((entry) => entry.type === 'file' && targets.has(entry.name.toLowerCase()));
     }, [browser.entries, browser.filename, browser.mode, browser.open, browser.saveKind]);
 
-    useEffect(() => {
-        if (mode === 'map' && isMapAtInitial && mapDirty) setMapDirty(false);
-    }, [isMapAtInitial, mapDirty, mode]);
-
     const showNotice = useCallback((text: string, error = false) => {
         if (noticeTimerRef.current !== null) window.clearTimeout(noticeTimerRef.current);
         setNotice({ text, error });
@@ -407,17 +402,95 @@ function App() {
         if (noticeTimerRef.current !== null) window.clearTimeout(noticeTimerRef.current);
     }, []);
 
+    const installWorkspace = useCallback((session: Workspace) => {
+        const { base, location, basePoints, baseMask } = session;
+        openedMapRef.current = { ...base, maskData: baseMask };
+        openedWaypointsRef.current = basePoints;
+        openedSlotNamesRef.current = Object.fromEntries(basePoints.map(point => [point.id, point.name]));
+        replaceGrid(base.data, base.width, base.height, base.metadata, session.mapDraft);
+        setWorkspaceRoot(location.root);
+        setSourcePath(location.map);
+        setMaskPath(location.mask);
+        setWaypointsPath(location.waypoints);
+        setMaskData(session.maskDraft ?? baseMask);
+        setMaskOccupiedCount(countOccupied(session.maskDraft ?? baseMask));
+        setMaskHistory(session.maskDraft ? [baseMask] : []);
+        setMaskFuture([]);
+        setWaypointEntries(session.pointDraft ?? basePoints);
+        setWaypointHistory(session.pointDraft ? [basePoints] : []);
+        setWaypointFuture([]);
+        setDraftSlotNames(session.names);
+        setMode(location.mode);
+        setLoaded(true);
+    }, [replaceGrid]);
+
+    useEffect(() => {
+        if (typeof indexedDB === 'undefined') { setCacheError('浏览器缓存不可用'); return; }
+        let cancelled = false;
+        void (async () => {
+            try {
+                const cached = await readWorkspace();
+                if (!cached || cancelled) return;
+                try {
+                    const disk = await readDiskWorkspace(cached);
+                    if (cancelled) return;
+                    if (hasDraft(cached)) setRecovery({ cached, disk, warning: sameBase(cached, disk) ? '' : '磁盘文件已改变。草稿基于旧版本，恢复后建议另存。' });
+                    else installWorkspace(disk);
+                } catch (error) {
+                    if (cancelled) return;
+                    const warning = error instanceof Error ? error.message : '无法读取磁盘文件';
+                    if (hasDraft(cached)) setRecovery({ cached, warning });
+                    else showNotice(`无法重开上次地图：${warning}。可以手动打开。`, true);
+                }
+            } catch {
+                if (!cancelled) setCacheError('浏览器缓存不可用');
+            } finally {
+                if (!cancelled) setStarting(false);
+            }
+        })();
+        return () => { cancelled = true; };
+    }, [showNotice, installWorkspace]);
+
+    const location = useMemo(() => ({ root: workspaceRoot, map: sourcePath, mask: maskPath, waypoints: waypointsPath, mode }), [workspaceRoot, sourcePath, maskPath, waypointsPath, mode]);
+    const base = useMemo(() => baseline && ({ width: baseline.width, height: baseline.height, metadata: baseline.metadata, data: baseline.data }), [baseline]);
+    const session = useMemo<Workspace | null>(() => base && baseline && ({ location, base, basePoints, baseMask: baseline.maskData, names: draftSlotNames,
+        mapDraft: mapDirty ? committedData : null, maskDraft: maskDirty ? committedMask : null, pointDraft: waypointsDirty ? waypointEntries : null }),
+    [base, baseline, location, basePoints, draftSlotNames, committedData, committedMask, mapDirty, maskDirty, waypointsDirty, waypointEntries]);
+    const cacheReady = session !== null && confirmedSession === session;
+    const cachedDraft = cacheReady && activeDirty;
+    const cacheStatus = cacheError || (!cacheReady ? '正在缓存…' : cachedDraft ? '草稿已缓存' : hasChanges ? '本层无未保存修改' : '无未保存修改');
+    const CacheIcon = cacheError ? TriangleAlert : !cacheReady ? LoaderCircle : cachedDraft ? CheckCircle2 : HardDrive;
+    useEffect(() => {
+        if (!loaded || !session || starting || recovery || browser.loading || typeof indexedDB === 'undefined') return;
+        const previous = lastWrite.current;
+        if (previous === session) return;
+        lastWrite.current = session;
+        void writeWorkspace(session, previous).then(() => {
+            if (lastWrite.current === session) { setConfirmedSession(session); setCacheError(''); }
+        }).catch(() => {
+            if (lastWrite.current !== session) return;
+            lastWrite.current = null;
+            setCacheError('浏览器缓存失败，请手动保存');
+        });
+    }, [loaded, session, starting, recovery, browser.loading]);
+
+    useEffect(() => {
+        if (!hasChanges || (cacheReady && !cacheError)) return;
+        const warn = (event: BeforeUnloadEvent) => { event.preventDefault(); event.returnValue = ''; };
+        window.addEventListener('beforeunload', warn);
+        return () => window.removeEventListener('beforeunload', warn);
+    }, [cacheReady, cacheError, hasChanges]);
+
     const handleGridUpdate = useCallback((nextData: GridData, commit = true) => {
         if (mode === 'map') {
             updateGrid(nextData, width, height, commit);
         } else {
             if (!commit && !maskEditStartRef.current) {
-                maskEditStartRef.current = new Int8Array(maskData || new Int8Array(width * height).fill(CELL_FREE));
+                maskEditStartRef.current = maskData || new Int8Array(width * height).fill(CELL_FREE);
             }
             if (commit) {
                 const previous = maskEditStartRef.current || maskData;
                 if (previous) {
-                    if (maskHistory.length >= MAX_LAYER_HISTORY) setMaskHistoryTruncated(true);
                     setMaskHistory((history) => appendLayerSnapshot(history, new Int8Array(previous)));
                 }
                 maskEditStartRef.current = null;
@@ -427,12 +500,9 @@ function App() {
             if (commit) setMaskOccupiedCount(countOccupied(nextData));
             if (commit) setMaskFuture([]);
         }
-        if (mode === 'map') setMapDirty(true);
-        else setMaskDirty(true);
-    }, [height, maskData, maskHistory.length, mode, updateGrid, width]);
+    }, [height, maskData, mode, updateGrid, width]);
 
     const handleUndo = useCallback(() => {
-        const maskUndoToInitial = mode === 'mask' && maskHistory.length === 1 && !maskHistoryTruncated;
         if (mode === 'map') undo();
         else if (mode === 'waypoints') {
             if (!waypointHistory.length) return;
@@ -448,12 +518,8 @@ function App() {
             setMaskData(new Int8Array(previous));
             setMaskOccupiedCount(countOccupied(previous));
             setMaskHistory((history) => history.slice(0, -1));
-            if (maskUndoToInitial) setMaskDirty(false);
         }
-        if (mode === 'map') setMapDirty(true);
-        else if (mode === 'waypoints') setWaypointsDirty(true);
-        else if (!maskUndoToInitial) setMaskDirty(true);
-    }, [maskData, maskHistory, maskHistoryTruncated, mode, undo, waypointEntries, waypointHistory]);
+    }, [maskData, maskHistory, mode, undo, waypointEntries, waypointHistory]);
 
     const handleRedo = useCallback(() => {
         if (mode === 'map') redo();
@@ -467,16 +533,12 @@ function App() {
             setExpandedSlotId(null);
         } else if (maskData && maskFuture.length) {
             const next = maskFuture[maskFuture.length - 1];
-            if (maskHistory.length >= MAX_LAYER_HISTORY) setMaskHistoryTruncated(true);
             setMaskHistory((history) => appendLayerSnapshot(history, new Int8Array(maskData)));
             setMaskData(new Int8Array(next));
             setMaskOccupiedCount(countOccupied(next));
             setMaskFuture((future) => future.slice(0, -1));
         }
-        if (mode === 'map') setMapDirty(true);
-        else if (mode === 'waypoints') setWaypointsDirty(true);
-        else setMaskDirty(true);
-    }, [maskData, maskFuture, maskHistory.length, mode, redo, waypointEntries, waypointFuture]);
+    }, [maskData, maskFuture, mode, redo, waypointEntries, waypointFuture]);
 
     // --- 地点层操作 ---
     // 空卡只是编辑器草稿；只有完成地图标记后才创建可导出的点位。
@@ -512,14 +574,12 @@ function App() {
         setWaypointHistory((history) => [...history, waypointEntries]);
         setWaypointFuture([]);
         setWaypointEntries((entries) => [...entries.filter((item) => item.id !== slotId), waypoint]);
-        setWaypointsDirty(true);
         // 连续标记：地图上的标记本身就是成功反馈，不再弹顶部通知，
         // 避免与画布内提示条在视觉上打架；只有失败才弹通知。
     }, [draftSlotNames, height, markingSlotId, metadata, showNotice, waypointEntries]);
 
     const updateWaypointField = useCallback((id: string, patch: Partial<Pick<Waypoint, 'name' | 'aliases'>>) => {
         setWaypointEntries((entries) => entries.map((item) => (item.id === id ? { ...item, ...patch } : item)));
-        setWaypointsDirty(true);
     }, []);
 
     const updateSlotName = useCallback((id: string, name: string) => {
@@ -548,14 +608,12 @@ function App() {
             }
             return next;
         }));
-        setWaypointsDirty(true);
     }, [height, metadata]);
 
     const clearWaypoint = useCallback((slotId: string) => {
         setWaypointHistory((history) => [...history, waypointEntries]);
         setWaypointFuture([]);
         setWaypointEntries((entries) => entries.filter((item) => item.id !== slotId));
-        setWaypointsDirty(true);
         if (markingSlotId === slotId) setMarkingSlotId(null);
         if (expandedSlotId === slotId) setExpandedSlotId(null);
     }, [expandedSlotId, markingSlotId, waypointEntries]);
@@ -617,14 +675,7 @@ function App() {
         const contextMetadata = context?.metadata ?? metadata;
         const expectedImage = context?.image ?? sourcePath.split('/').pop() ?? null;
         try {
-            const parsed = parseWaypointsYaml(text, contextHeight, contextMetadata);
-            const mismatch = describeBindingMismatch(parsed.mapBinding, contextMetadata, contextWidth, contextHeight, expectedImage);
-            if (mismatch) throw new Error(mismatch);
-            // 未知 ID 必须显式报错，避免旧文件被静默过滤后保存为空。
-            const validSlotIds = new Set(PRESET_SLOTS.map((slot) => slot.id));
-            const unknown = parsed.waypoints.find((waypoint) => !validSlotIds.has(waypoint.id));
-            if (unknown) throw new Error(`点位 ID ${unknown.id} 不属于当前 A–J 槽位，请先转换地点文件`);
-            const entries = parsed.waypoints;
+            const entries = readBoundPoints(text, { width: contextWidth, height: contextHeight, metadata: contextMetadata }, expectedImage || '');
             const slotNames = Object.fromEntries(entries.map((waypoint) => [waypoint.id, waypoint.name]));
             openedWaypointsRef.current = entries.map((waypoint) => ({ ...waypoint }));
             openedSlotNamesRef.current = slotNames;
@@ -634,7 +685,6 @@ function App() {
             setExpandedSlotId(null);
             setWaypointHistory([]);
             setWaypointFuture([]);
-            setWaypointsDirty(false);
             setWaypointsPath(path);
             return null;
         } catch (error) {
@@ -723,6 +773,7 @@ function App() {
     const openSelectedMap = async (entry?: BoardEntry) => {
         const selected = entry || browser.selected;
         if (!selected || browser.loading || browserOperationRef.current || !/\.pgm$/i.test(selected.name)) return;
+        if (hasChanges && !window.confirm('打开地图会放弃当前未保存的修改，继续吗？')) return;
         browserOperationRef.current = true;
         setBrowser((current) => ({ ...current, loading: true }));
         try {
@@ -735,7 +786,7 @@ function App() {
             const yamlText = yamlResponse ? await yamlResponse.text() : '';
             const fileMetadata = yamlText
                 ? parseMapYaml(yamlText)
-                : { ...defaultMetadata, origin: { ...defaultMetadata.origin } };
+                : { ...DEFAULT_METADATA, origin: { ...DEFAULT_METADATA.origin } };
             const nextData = pgmToGrid(parsed, fileMetadata);
 
             const initialMaskData = new Int8Array(nextData.length).fill(CELL_FREE);
@@ -751,21 +802,19 @@ function App() {
             setMaskOccupiedCount(countOccupied(initialMaskData));
             setMaskHistory([]);
             setMaskFuture([]);
-            setMaskHistoryTruncated(false);
+            maskEditStartRef.current = null;
+            setWorkspaceRoot(browser.root);
             setSourcePath(selected.path);
             setMaskPath('');
             setWaypointEntries([]);
             setDraftSlotNames({ ...EXAMPLE_SLOT_NAMES });
             setWaypointHistory([]);
             setWaypointFuture([]);
-            setWaypointsDirty(false);
             setWaypointsPath('');
             openedWaypointsRef.current = [];
             openedSlotNamesRef.current = { ...EXAMPLE_SLOT_NAMES };
             setMarkingSlotId(null);
             setExpandedSlotId(null);
-            setMapDirty(false);
-            setMaskDirty(false);
             setMode('map');
             let loadNotice = yamlEntry ? `已加载 ${selected.name}` : `已加载 ${selected.name}（使用默认 YAML 参数）`;
             let waypointLoadError = '';
@@ -803,6 +852,7 @@ function App() {
             return;
         }
         if (!selected || browser.loading || browserOperationRef.current || !/\.pgm$/i.test(selected.name)) return;
+        if (maskDirty && !window.confirm('打开掩码会放弃当前掩码修改，继续吗？')) return;
         browserOperationRef.current = true;
         setBrowser((current) => ({ ...current, loading: true }));
         try {
@@ -826,10 +876,8 @@ function App() {
             setMaskOccupiedCount(countOccupied(nextMaskData));
             setMaskHistory([]);
             setMaskFuture([]);
-            setMaskHistoryTruncated(false);
             maskEditStartRef.current = null;
             setMaskPath(selected.path);
-            setMaskDirty(false);
             openedMapRef.current = openedMapRef.current
                 ? { ...openedMapRef.current, maskData: new Int8Array(nextMaskData) }
                 : null;
@@ -873,24 +921,20 @@ function App() {
 
     const resetToOpenedMap = useCallback(() => {
         const openedMap = openedMapRef.current;
-        if (!openedMap) return;
+        if (!openedMap || !window.confirm('放弃所有图层未保存的修改？')) return;
         resetGrid(openedMap.data, openedMap.width, openedMap.height, openedMap.metadata);
         setMaskData(new Int8Array(openedMap.maskData));
         setMaskOccupiedCount(countOccupied(openedMap.maskData));
         setMaskHistory([]);
         setMaskFuture([]);
-        setMaskHistoryTruncated(false);
         maskEditStartRef.current = null;
         const reopenedWaypoints = openedWaypointsRef.current.map((waypoint) => ({ ...waypoint }));
         setWaypointEntries(reopenedWaypoints);
         setDraftSlotNames({ ...openedSlotNamesRef.current });
         setWaypointHistory([]);
         setWaypointFuture([]);
-        setWaypointsDirty(false);
         setMarkingSlotId(null);
         setExpandedSlotId(null);
-        setMapDirty(false);
-        setMaskDirty(false);
         showNotice('已重置地图');
     }, [resetGrid, showNotice]);
 
@@ -933,7 +977,6 @@ function App() {
                 };
                 const yamlPath = joinBoardPath(browser.path, `${base}.yaml`);
                 await saveSingleFile(yamlPath, new TextEncoder().encode(serializeWaypointsYaml(file)));
-                setWaypointsDirty(false);
                 setWaypointsPath(yamlPath);
                 openedWaypointsRef.current = waypointEntries.map((waypoint) => ({ ...waypoint }));
                 const savedSlotNames = Object.fromEntries(waypointEntries.map((waypoint) => [waypoint.id, waypoint.name]));
@@ -960,8 +1003,18 @@ function App() {
                 yamlPath,
                 new TextEncoder().encode(gridToYaml(metadata, pgmName)),
             );
-            if (browser.saveKind === 'map') setMapDirty(false);
-            else setMaskDirty(false);
+            const opened = openedMapRef.current!;
+            if (browser.saveKind === 'map') {
+                openedMapRef.current = { ...opened, data, metadata: { ...metadata, image: pgmName } };
+                setSourcePath(pgmPath);
+                if (pgmPath !== sourcePath) {
+                    setWaypointsPath('');
+                    openedWaypointsRef.current = [];
+                }
+            } else {
+                openedMapRef.current = { ...opened, maskData: data };
+                setMaskPath(pgmPath);
+            }
             closeBrowser();
             showNotice(`已保存到 ${pgmPath}`);
         } catch (error) {
@@ -1003,13 +1056,11 @@ function App() {
     const clearMask = useCallback(() => {
         const current = maskData || new Int8Array(width * height).fill(CELL_FREE);
         if (!current.some((value) => value !== CELL_FREE)) return;
-        if (maskHistory.length >= MAX_LAYER_HISTORY) setMaskHistoryTruncated(true);
         setMaskHistory((history) => appendLayerSnapshot(history, new Int8Array(current)));
         setMaskFuture([]);
         setMaskData(new Int8Array(width * height).fill(CELL_FREE));
         setMaskOccupiedCount(0);
-        setMaskDirty(true);
-    }, [height, maskData, maskHistory.length, width]);
+    }, [height, maskData, width]);
 
     const renderEntries = () => {
         if (browser.loading) return <div className="py-16 text-center text-sm text-gray-400">读取中...</div>;
@@ -1061,6 +1112,19 @@ function App() {
 
     return (
         <div className="flex h-screen flex-col overflow-hidden bg-white text-black">
+            {(starting || recovery) && <div className="fixed inset-0 z-50 grid place-items-center bg-black/30 p-4" role="dialog" aria-modal="true" aria-label="恢复工作区">
+                <section className="w-full max-w-sm rounded-lg border border-gray-200 bg-white p-5 shadow-xl">
+                    <h2 className="font-semibold">{starting ? '正在重开上次工作区…' : '发现未保存的草稿'}</h2>
+                    {recovery && <><p className="mt-2 break-all text-sm text-gray-600">{recovery.cached.location.map}</p>
+                        {recovery.warning && <p className="mt-2 text-sm text-amber-700">{recovery.warning}</p>}
+                        <div className="mt-5 flex flex-wrap gap-2"><button autoFocus type="button" className="rounded bg-black px-3 py-2 text-sm text-white" onClick={() => { installWorkspace(recovery.cached); setRecovery(null); }}><RotateCcw className="mr-1 inline" size={15} />恢复草稿</button>
+                            <button type="button" className="rounded border px-3 py-2 text-sm" onClick={() => {
+                                if (recovery.disk) installWorkspace(recovery.disk);
+                                else void writeWorkspace(null).catch(() => showNotice('清除缓存失败', true));
+                                setRecovery(null);
+                            }}>{recovery.disk ? '放弃草稿，使用磁盘版本' : '放弃草稿，重新选图'}</button></div></>}
+                </section>
+            </div>}
             <header className="z-10 flex h-16 shrink-0 items-center justify-between gap-4 border-b border-gray-200 px-6">
                 <div className="flex shrink-0 items-center gap-2">
                     <h1 className="text-xl font-bold tracking-tight">Occupancy Editor</h1>
@@ -1094,6 +1158,7 @@ function App() {
             <div className="flex min-h-0 flex-1 overflow-hidden">
                 <main ref={canvasAreaRef} className="relative min-w-0 flex-1 overflow-hidden bg-gray-100">
                     {loaded && <GridCanvas
+                        key={`${workspaceRoot}/${sourcePath}`} viewKey={`${workspaceRoot}/${sourcePath}`}
                         ref={canvasRef}
                         width={width}
                         height={height}
@@ -1122,6 +1187,12 @@ function App() {
                     )}
                     {loaded && <div className="pointer-events-none absolute bottom-5 left-5 flex max-w-[calc(100%-2rem)] flex-wrap items-center gap-x-3 gap-y-1 rounded-md border border-gray-200 bg-white px-3 py-2 text-xs text-gray-600 shadow-md">
                         <span className="font-mono">{width} × {height} ({metadata.resolution} m/px)</span>
+                        <span role="status" aria-atomic="true"
+                            title={!cacheError && cachedDraft ? '仅缓存在此浏览器，尚未写入磁盘文件' : undefined}
+                            className={clsx('pointer-events-auto inline-flex min-w-0 max-w-full items-center gap-1.5 font-medium', cacheError ? 'text-amber-700' : cachedDraft ? 'text-emerald-700' : 'text-gray-600')}>
+                            <CacheIcon aria-hidden="true" size={14} className={clsx('shrink-0', !cacheError && !cacheReady && 'motion-safe:animate-spin')} />
+                            {cacheStatus}
+                        </span>
                         <span className="h-4 w-px bg-gray-200" />
                         <span className="flex items-center gap-1.5"><i className="h-2.5 w-2.5 rounded-sm bg-black" />占用</span>
                         <span className="flex items-center gap-1.5"><i className="h-2.5 w-2.5 rounded-sm border border-gray-300 bg-white" />空闲</span>

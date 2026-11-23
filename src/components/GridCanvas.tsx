@@ -8,6 +8,7 @@ import {
 } from '../utils/waypoints';
 
 interface GridCanvasProps {
+    viewKey: string;
     width: number;
     height: number;
     data: Int8Array;
@@ -55,7 +56,7 @@ function bresenham(x0: number, y0: number, x1: number, y1: number): { x: number;
 }
 
 export const GridCanvas = React.forwardRef<GridCanvasHandle, GridCanvasProps>(({
-    width, height, data, backgroundData, tool, brushSize, onUpdate,
+    viewKey, width, height, data, backgroundData, tool, brushSize, onUpdate,
     markingSlot = null, placedWaypoints = [], baseMapData = null,
     onPlaceWaypoint, onCancelMarking, markerArrowCells = 15,
 }, ref) => {
@@ -120,9 +121,24 @@ export const GridCanvas = React.forwardRef<GridCanvasHandle, GridCanvasProps>(({
     useEffect(() => {
         if (!initialized && containerRef.current) {
             fitView();
+            try {
+                const saved = JSON.parse(localStorage.getItem('occupancy-editor:last-view') || 'null');
+                if (saved?.key === viewKey && saved.width === width && saved.height === height && [saved.k, saved.centerX, saved.centerY].every(Number.isFinite)) {
+                    const scale = Math.min(100, Math.max(getFitScale(), saved.k));
+                    setTransform({ k: scale, x: containerRef.current.clientWidth / 2 - saved.centerX * scale, y: containerRef.current.clientHeight / 2 - saved.centerY * scale });
+                }
+            } catch { /* View storage is optional. */ }
             setInitialized(true);
         }
-    }, [initialized, fitView]);
+    }, [initialized, fitView, viewKey, width, height, getFitScale]);
+
+    useEffect(() => {
+        if (!initialized || !containerRef.current) return;
+        const { clientWidth, clientHeight } = containerRef.current;
+        try {
+            localStorage.setItem('occupancy-editor:last-view', JSON.stringify({ key: viewKey, width, height, k: transform.k, centerX: (clientWidth / 2 - transform.x) / transform.k, centerY: (clientHeight / 2 - transform.y) / transform.k }));
+        } catch { /* Editing works without view storage. */ }
+    }, [initialized, transform, viewKey, width, height]);
 
     // Coordinate conversion helpers
     // Display coordinates: center-based (-width/2 to +width/2, -height/2 to +height/2)

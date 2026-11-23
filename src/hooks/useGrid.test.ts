@@ -4,6 +4,18 @@ import { CELL_FREE, CELL_OCCUPIED } from '../types';
 import { useGrid } from './useGrid';
 
 describe('useGrid history baseline', () => {
+    it('recovers a committed draft and can undo to the disk baseline', () => {
+        const { result } = renderHook(() => useGrid({ initialWidth: 1, initialHeight: 1, initialResolution: 1 }));
+        const disk = new Int8Array([CELL_FREE, CELL_FREE]);
+        const draft = new Int8Array([CELL_OCCUPIED, CELL_FREE]);
+        act(() => result.current.replaceGrid(disk, 2, 1, { resolution: 1, origin: { x: 0, y: 0, theta: 0 } }, draft));
+        expect(result.current.committedData).toEqual(draft);
+        act(() => result.current.updateGrid(new Int8Array([CELL_OCCUPIED, CELL_OCCUPIED]), 2, 1, false));
+        expect(result.current.committedData).toEqual(draft);
+        act(() => result.current.undo());
+        expect(result.current.gridData).toEqual(disk);
+    });
+
     it('starts undo history at the imported map', () => {
         const { result } = renderHook(() => useGrid({ initialWidth: 2, initialHeight: 2, initialResolution: 0.05 }));
         const imported = new Int8Array([CELL_OCCUPIED, CELL_FREE, CELL_FREE, CELL_OCCUPIED]);
