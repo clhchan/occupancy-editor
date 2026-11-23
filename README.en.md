@@ -58,15 +58,15 @@ _Figure 2. Navigation waypoints and Keepout zones in RViz/Nav2 (illustration)._
 
 ### 🧰 Prerequisites
 
-- Node.js 18 or newer
-- Python 3
+- **To run the editor**: The host needs only Bash, Python 3, and the complete `dist/` shipped with the repository. Node.js and npm are not required.
+- **To develop or rebuild the frontend**: You also need Node.js 18 or newer and npm.
 
 ### Author Development Environment
 
 - Ubuntu 22.04 arm64
 - ROS 2 Humble
 
-### 📦 Installation
+### 📦 Get the Editor
 
 Clone this repository and enter its root directory:
 
@@ -75,19 +75,17 @@ git clone https://github.com/clhchan/occupancy-editor.git
 cd occupancy-editor
 ```
 
-Install the frontend dependencies from that directory:
-
-```bash
-npm install
-```
+When distributing the editor in an archive or another project, keep the **entire `dist/` directory** alongside `start.sh` and `serve.py`, including `index.html` and the assets it references. You do not need to copy `node_modules/`.
 
 ### ▶️ Running Locally
 
-`start.sh` serves the built frontend and the local file API. If `dist/` does not exist, it builds the frontend automatically. If `dist/` already exists and the source has changed, run `npm run build` first.
+From the repository root, run:
 
 ```bash
 ./start.sh
 ```
+
+Starting with v0.2.2, the prebuilt `dist/` is checked into Git. When the entry page and its assets are intact, the script starts the Python file service directly. Even on first startup or without internet access, it neither installs dependencies nor builds the frontend.
 
 Open `http://localhost:8080`. When the server listens on all interfaces, startup output also lists the available Ethernet and wireless URLs. From another device on the same LAN, use one of those addresses, for example `http://192.168.1.20:8080`.
 
@@ -97,7 +95,13 @@ The listener can be configured with environment variables:
 OCCUPANCY_EDITOR_HOST=0.0.0.0 OCCUPANCY_EDITOR_PORT=8080 ./start.sh
 ```
 
+**If `dist/` is incomplete:** Restore the entire directory from the same version. Alternatively, if the source, Node.js, and npm are available, the script rebuilds with `npm run build` using the project's installed build tools. If those tools are missing, it first installs the locked dependencies with `npm ci --include=dev`.
+
+**To rebuild offline:** Run `./start.sh --offline` to prevent npm from using the network. If dependencies need to be installed, the local npm cache must contain all required packages, including those for the target OS and CPU architecture. Without a usable `dist/`, installed build tools, or a complete cache, startup fails. To avoid preparing a cache on an offline host, build elsewhere and deliver the complete `dist/` instead.
+
 ### 🧪 Development Server
+
+`--dev` runs the Vite development server, not the prebuilt `dist/`. The development machine needs Node.js, npm, Python 3, and the project's development dependencies.
 
 ```bash
 ./start.sh --dev
@@ -173,13 +177,15 @@ Paths are restricted to the directory set by `--data-root`, which defaults to th
 
 ## Development
 
-Run the test suite, linter, and production build with:
+Install dependencies with `npm ci --include=dev` when setting up a development machine. To run the tests, linter, and production build:
 
 ```bash
 npm test -- --run
 npm run lint
 npm run build
 ```
+
+After changing the frontend, commit the regenerated `dist/` alongside the source. Source changes alone do not update the page served by a normal `./start.sh` launch.
 
 The main application is in `src/`, ROS PGM/YAML conversion is in `src/utils/rosMap.ts`, and the local file service is implemented by `serve.py`.
 

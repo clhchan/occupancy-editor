@@ -5,5 +5,7 @@
 
 - [v0.1.0 发布说明与截图](releases/v0.1.0/release-notes-v0.1.0.md)
 - v0.2.0 发布草稿：[中文](releases/v0.2.0/release-notes-v0.2.0.md) / [English](releases/v0.2.0/release-notes-v0.2.0.en.md)
+- v0.2.1 工作区恢复：[中文](releases/v0.2.1/release-notes-v0.2.1.md) / [English](releases/v0.2.1/release-notes-v0.2.1.en.md)
+- v0.2.2 预构建前端与离线启动：[中文](releases/v0.2.2/release-notes-v0.2.2.md) / [English](releases/v0.2.2/release-notes-v0.2.2.en.md)
 
 `public/` 存放网页运行时使用的资源，不作为文档截图归档目录。

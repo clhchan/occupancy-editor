@@ -58,15 +58,15 @@ _图 2：RViz/Nav2 中的导航点位与禁行区效果示意。_
 
 ### 🧰 前置条件
 
-- Node.js 18 或更高版本
-- Python 3
+- **运行编辑器**：主机只需 Bash、Python 3 和仓库随附的完整 `dist/`，无需安装 Node.js 或 npm。
+- **开发或重建前端**：另需 Node.js 18 或更高版本和 npm。
 
 ### 作者开发环境
 
 - Ubuntu 22.04 arm64
 - ROS 2 Humble
 
-### 📦 安装
+### 📦 获取编辑器
 
 克隆仓库并进入仓库根目录：
 
@@ -75,19 +75,17 @@ git clone https://github.com/clhchan/occupancy-editor.git
 cd occupancy-editor
 ```
 
-然后仍然在这个目录中安装前端依赖：
-
-```bash
-npm install
-```
+如果通过压缩包或另一个项目交付编辑器，请连同 `start.sh`、`serve.py` 一起保留**整个 `dist/` 目录**，包括 `index.html` 和它引用的资源。不必复制 `node_modules/`。
 
 ### ▶️ 本地运行
 
-`start.sh` 会提供构建后的前端和本地文件 API。如果不存在 `dist/`，会自动先构建前端；若已存在 `dist/` 且源码有更新，请先运行 `npm run build`。
+在仓库根目录运行：
 
 ```bash
 ./start.sh
 ```
+
+从 v0.2.2 起，预构建的 `dist/` 随 Git 一起交付。只要入口和资源完整，脚本就直接启动 Python 文件服务；即使首次启动或没有外网，也不会安装依赖或构建前端。
 
 打开 `http://localhost:8080`。服务监听所有网卡时，启动输出会同时列出当前有地址的有线和无线网卡 URL。从同一局域网的其他设备访问时，直接使用其中一个地址，例如 `http://192.168.1.20:8080`。
 
@@ -97,7 +95,13 @@ npm install
 OCCUPANCY_EDITOR_HOST=0.0.0.0 OCCUPANCY_EDITOR_PORT=8080 ./start.sh
 ```
 
+**如果 `dist/` 不完整**：最简单的修复是从同一版本恢复整个 `dist/`。如果保留了源码且有 Node.js 和 npm，脚本会优先使用现有项目构建工具执行 `npm run build`；若缺少工具，则先按锁文件执行 `npm ci --include=dev`，再构建。
+
+**离线重建**：使用 `./start.sh --offline` 禁止 npm 联网。只有需要重新安装依赖时，才要求本机 npm 缓存中备齐锁文件所需的包，包括目标操作系统和 CPU 架构对应的包。若既没有可用的 `dist/` 和构建工具，缓存也不完整，脚本会报错退出。无需在离线主机上配置缓存：也可以在其他机器构建并交付完整的 `dist/`。
+
 ### 🧪 开发服务器
+
+`--dev` 启动的是 Vite 开发服务器，不使用预构建的 `dist/`。开发机需要 Node.js、npm、Python 3 和项目开发依赖。
 
 ```bash
 ./start.sh --dev
@@ -173,13 +177,15 @@ npm run dev
 
 ## 开发
 
-运行测试、代码检查和生产构建：
+首次开发时用 `npm ci --include=dev` 安装依赖。运行测试、代码检查和生产构建：
 
 ```bash
 npm test -- --run
 npm run lint
 npm run build
 ```
+
+修改前端后，将重新生成的 `dist/` 与源码一起提交；只更新源码不会改变普通 `./start.sh` 提供的页面。
 
 主要前端代码位于 `src/`，ROS PGM/YAML 转换位于 `src/utils/rosMap.ts`，本地文件服务位于 `serve.py`。
 

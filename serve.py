@@ -16,6 +16,7 @@ import sys
 import tempfile
 import threading
 from pathlib import Path
+from html.parser import HTMLParser
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlsplit
 
@@ -40,6 +41,32 @@ def _paint(text: str, color: str, stream) -> str:
 
 class ReusableServer(ThreadingHTTPServer):
     allow_reuse_address = True
+
+
+class FrontendAssets(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.resources = []
+
+    def handle_starttag(self, tag, attrs):
+        attributes = dict(attrs)
+        if tag == 'script' and attributes.get('type') == 'module':
+            self.resources.append(('script', attributes.get('src')))
+        elif tag == 'link' and attributes.get('rel') in ('stylesheet', 'icon', 'modulepreload'):
+            self.resources.append((attributes['rel'], attributes.get('href')))
+
+
+def check_dist(directory: Path) -> None:
+    page = FrontendAssets()
+    page.feed((directory / 'index.html').read_text(encoding='utf-8'))
+    page.close()
+    if not {'script', 'stylesheet'}.issubset(kind for kind, _ in page.resources):
+        raise ValueError('dist/index.html 未引用构建后的 JS 或 CSS')
+    for _, url in page.resources:
+        parsed = urlsplit(url or '')
+        path = directory / unquote(parsed.path).lstrip('/')
+        if parsed.scheme or parsed.netloc or not path.is_file() or not path.stat().st_size:
+            raise ValueError(f'dist/ 缺少离线资源: {url}')
 
 
 class OccupancyHandler(SimpleHTTPRequestHandler):
@@ -286,8 +313,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(description='Occupancy Editor local file server')
     parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument('--port', type=int, default=8080)
+    parser.add_argument('--check-dist', action='store_true', help='只检查预构建前端及入口引用的本地资源')
     parser.add_argument('--data-root', default=str(Path.home()), help='文件根目录，默认是当前用户 home')
     args = parser.parse_args()
+
+    if args.check_dist:
+        try:
+            check_dist(root / 'dist')
+        except (OSError, ValueError) as error:
+            sys.exit(f'前端构建不完整: {error}')
+        return
 
     data_root = Path(args.data_root).expanduser().resolve()
     if not data_root.is_dir():

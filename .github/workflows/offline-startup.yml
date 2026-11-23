@@ -1,0 +1,20 @@
+name: Offline distribution
+
+on: [push, pull_request]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start twice from the shipped files without Node.js
+        run: python3 -B -m unittest discover -s tests -v
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci --include=dev --no-audit --no-fund
+      - run: npm run build
+      - name: Check that the shipped files match the build
+        run: |
+          git status --short -- dist
+          test -z "$(git status --porcelain --untracked-files=all -- dist)"
